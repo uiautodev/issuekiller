@@ -134,7 +134,7 @@ const zh: Record<string, string> = {
 	'settings.release': '定时发版',
 	'settings.releaseHint': 'feat 提交升 minor，其余升 patch；到点（本机时区）发布，默认每天 09:00；保持默认时不写入配置。',
 	'settings.releaseEnabled': '启用',
-	'settings.releaseVPrefix': '标签加 v 前缀',
+	'settings.releaseVPrefix': 'v 前缀',
 	'settings.releaseInterval': '间隔（天）',
 	'settings.releaseIntervalInvalid': '发版间隔必须是 ≥1 的整数',
 	'settings.releaseTime': '时间（本地）',
