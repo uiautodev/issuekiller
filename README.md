@@ -201,6 +201,12 @@ Open an issue that mentions the bot (or assign it to the bot). Then:
 | 👍 on the bot's “Review 已提交” comment | apply that review's findings to the PR (edit + push) |
 | 👍 on the bot's “Something went wrong” / blocked comment | retry the blocked task (same as `@agent continue`) |
 
+A new pull request in a watched repo is reviewed **automatically** (on by
+default): every new head gets the same review with inline findings, while
+drafts and the bot's own PRs are left alone. A repo that only wants the manual
+command sets `"autoReview": false`; a failed review is retried by a new push or
+`@agent review`, not by the poller.
+
 Every accepted 👍 gets an 👀 reaction immediately, so you can see the daemon
 picked it up while the work is still running.
 
@@ -216,8 +222,8 @@ comment**. Approval words, status labels and review rules live in
 
 `-init` writes the config for you; a hand-written JSON uses the same `repos` /
 `codingAgent` / `approvers` / `proxy` keys. Full reference (`language`, `mode`,
-`webPort`, `updateProxy`, per-repo overrides including the opt-in `release`
-schedule, live reload):
+`autoReview`, `webPort`, `updateProxy`, per-repo overrides including the
+opt-in `release` schedule, live reload):
 [DEPLOY.md](DEPLOY.md#41-configuration-reference). With `selfUpdate` on, the
 daemon installs new releases itself (checksums verified, `updateProxy` mirror
 when github.com is unreachable); the dashboard can also check and install on

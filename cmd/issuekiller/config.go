@@ -75,6 +75,10 @@ type RepoConfig struct {
 	Language     string
 	Mode         string
 	Release      ReleaseConfig
+	// AutoReview reviews pull requests the daemon did not open. It is on by
+	// default; repos that only want the manual `@bot review` command set
+	// autoReview: false.
+	AutoReview bool
 }
 
 // ReleaseConfig is the opt-in periodic release for one repository. Publishing
@@ -124,6 +128,9 @@ type repoOptions struct {
 	Language     string         `json:"language"`
 	Mode         string         `json:"mode"`
 	Release      releaseOptions `json:"release"`
+	// AutoReview is a pointer so an absent key (enabled, the default) stays
+	// distinguishable from an explicit opt-out.
+	AutoReview *bool `json:"autoReview"`
 }
 
 // releaseOptions mirrors ReleaseConfig in the config file. intervalDays is a
@@ -249,6 +256,10 @@ func normalizeRepos(raw json.RawMessage, defaults repoOptions) ([]RepoConfig, er
 		if err != nil {
 			return nil, fmt.Errorf("repo %s: %w", fullName, err)
 		}
+		autoReview := true
+		if entry.AutoReview != nil {
+			autoReview = *entry.AutoReview
+		}
 		repos = append(repos, RepoConfig{
 			FullName:     fullName,
 			Owner:        parts[0],
@@ -260,6 +271,7 @@ func normalizeRepos(raw json.RawMessage, defaults repoOptions) ([]RepoConfig, er
 			Language:     firstNonEmpty(entry.Language, defaults.Language, "auto"),
 			Mode:         mode,
 			Release:      release,
+			AutoReview:   autoReview,
 		})
 	}
 	return repos, nil

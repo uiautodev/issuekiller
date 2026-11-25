@@ -88,6 +88,41 @@ func TestNormalizeRepos(t *testing.T) {
 	}
 }
 
+// autoReview is on by default (the repo owner asked for review-on-receipt) and
+// only an explicit false per repo opts out.
+func TestAutoReviewConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	write := func(body string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cases := []struct {
+		body string
+		want bool
+	}{
+		{`{"repos": ["acme/one"]}`, true},
+		{`{"repos": {"acme/one": {}}}`, true},
+		{`{"repos": {"acme/one": {"autoReview": true}}}`, true},
+		{`{"repos": [{"repo": "acme/one", "autoReview": true}]}`, true},
+		{`{"repos": {"acme/one": {"autoReview": false}}}`, false},
+		{`{"repos": [{"repo": "acme/one", "autoReview": false}]}`, false},
+	}
+	for _, c := range cases {
+		write(c.body)
+		cfg, err := loadConfig(path)
+		if err != nil {
+			t.Fatalf("%s: %v", c.body, err)
+		}
+		if got := cfg.Repos[0].AutoReview; got != c.want {
+			t.Fatalf("%s: autoReview = %v, want %v", c.body, got, c.want)
+		}
+	}
+}
+
 func TestIsMentionAndCommands(t *testing.T) {
 	if !isMention("hey @my-agent look", "my-agent") {
 		t.Fatal("expected mention")
@@ -309,7 +344,7 @@ func TestMissingHookEvents(t *testing.T) {
 		t.Fatalf("nothing should be missing, got %v", got)
 	}
 	got := missingHookEvents([]string{"issues", "issue_comment"})
-	want := []string{"reaction", "pull_request_review", "pull_request_review_comment"}
+	want := []string{"reaction", "pull_request", "pull_request_review", "pull_request_review_comment"}
 	if len(got) != len(want) {
 		t.Fatalf("missing events = %v, want %v", got, want)
 	}

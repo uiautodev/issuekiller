@@ -517,6 +517,51 @@ func (r *Router) enqueueReviewFix(ctx context.Context, app *AppContext, fullName
 	})
 }
 
+// enqueueAutoReview starts a review of a pull request without waiting for an
+// approver command. Drafts, the bot's own PRs and a head SHA that was already
+// reviewed are skipped, so a redelivered event cannot restart the same review;
+// a new push changes the SHA and reviews again, and a manual `@bot review`
+// always goes through.
+func (r *Router) enqueueAutoReview(ctx context.Context, app *AppContext, pr PullRequest) {
+	if r.store == nil {
+		return
+	}
+	if !app.Repo.AutoReview || pr.State != "open" || pr.Draft {
+		return
+	}
+	if strings.EqualFold(pr.User.Login, r.agentLogin) {
+		return
+	}
+	st := r.store.Issue(app.Repo.FullName, pr.Number)
+	if st.ReviewedSHA == pr.Head.SHA {
+		return
+	}
+	// Record the head before the job runs: a failure on this SHA must not be
+	// retried on every poll, and a second delivery of the same event is a
+	// no-op. doReviewPR overwrites it with the head it actually reviewed.
+	r.store.SetReviewedSHA(app.Repo.FullName, pr.Number, pr.Head.SHA)
+	r.log.Info("auto review queued for %s#%d (head %s)", app.Repo.FullName, pr.Number, shortSHA(pr.Head.SHA))
+	key := fmt.Sprintf("%s#%d#review", app.Repo.FullName, pr.Number)
+	r.enqueue(app.Repo.FullName, key, stagePlan, func(jobCtx context.Context) {
+		// Re-read the PR: the head may have moved since the event, and a PR
+		// that was closed or re-drafted in the meantime needs no review.
+		fresh, err := app.GH.GetPR(jobCtx, app.Repo.FullName, pr.Number)
+		if err != nil {
+			app.Log.Warn("auto review %s#%d: %v", app.Repo.FullName, pr.Number, err)
+			return
+		}
+		if fresh.State != "open" || fresh.Draft {
+			return
+		}
+		doReviewPR(jobCtx, app, Trigger{
+			Type:        "auto",
+			IssueNumber: pr.Number,
+			Sender:      pr.User.Login,
+			Key:         fmt.Sprintf("autoreview-%d", time.Now().UnixNano()),
+		}, fresh)
+	})
+}
+
 // retryBlockedCI resumes a task that was parked because its pull request checks
 // failed, once those checks are green. Other blocked reasons (local checks, an
 // unreproducible bug, exhausted conflict rounds) stay parked for the user.
@@ -1546,7 +1591,7 @@ func (r *Router) PollOnce(ctx context.Context, fullName string) {
 			since = &safe
 		}
 	}
-	issues, err := app.GH.ListIssues(ctx, fullName, "all", since)
+	issues, err := app.GH.ListIssuesAndPRs(ctx, fullName, "all", since)
 	if err != nil {
 		r.log.Warn("poll %s: %v", fullName, err)
 		return
@@ -1559,6 +1604,19 @@ func (r *Router) PollOnce(ctx context.Context, fullName string) {
 	freshComments := 0
 	for _, issue := range issues {
 		number := issue.Number
+		// A pull request feeds only the auto-review fallback (the webhook
+		// is the primary source); its comments still arrive through
+		// issue_comment events, so the comment scan below stays issue-only.
+		if issue.PullRequest != nil {
+			if issue.State == "open" && app.Repo.AutoReview {
+				if pr, prErr := app.GH.GetPR(ctx, fullName, number); prErr == nil {
+					r.enqueueAutoReview(ctx, app, pr)
+				} else {
+					r.log.Debug("poll %s: fetch PR %d: %v", fullName, number, prErr)
+				}
+			}
+			continue
+		}
 		st := r.store.Issue(fullName, number)
 		if issue.State == "open" && wasReopened(st) {
 			r.HandleReopened(ctx, fullName, issue)

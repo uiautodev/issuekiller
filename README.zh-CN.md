@@ -167,6 +167,11 @@ go build -o bin/issuekiller ./cmd/issuekiller
 | bot 那条「Review 已提交」评论上的 👍 | 按这条 review 的意见直接改 PR 并推送 |
 | bot 那条「出错了 / 被阻塞」评论上的 👍 | 重试被阻塞的任务（等同 `@agent continue`） |
 
+被 watch 的仓库收到新 PR 会**自动 review**（默认开启）：每个新 head 都会收到
+同样的 review（总结 + 行内意见），draft 和 bot 自己提的 PR 除外；只想手动 review
+的仓库把 `"autoReview": false` 写进该仓库的配置。某个 head 的 review 失败后不会由
+轮询自动重试，新的 push 或 `@agent review` 才会再跑一次。
+
 每个被接受的 👍 都会立刻收到一个 👀 回应，任务还在排队或执行时也能看到已经收到。
 
 命令必须来自 approver、@ 了 agent，并且**整条评论就是命令**。批准词、状态标签
@@ -179,8 +184,8 @@ go build -o bin/issuekiller ./cmd/issuekiller
 ```
 
 `-init` 会写好配置；手写就是同样的 `repos` / `codingAgent` / `approvers` /
-`proxy` 字段。完整配置项（`language`、`mode`、`webPort`、`updateProxy`、每仓库覆盖
-（含可选的定时发版）、保存即重载）见
+`proxy` 字段。完整配置项（`language`、`mode`、`autoReview`、`webPort`、
+`updateProxy`、每仓库覆盖（含可选的定时发版）、保存即重载）见
 [DEPLOY.md](DEPLOY.md#41-configuration-reference)。打开
 `selfUpdate` 后 daemon 会自己安装新版本（校验 checksums，直连失败时走
 `updateProxy` 镜像）；也可以在看板里手动检查并升级。

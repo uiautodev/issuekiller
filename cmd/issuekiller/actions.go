@@ -761,6 +761,10 @@ func doReviewPR(ctx context.Context, app *AppContext, trigger Trigger, pr PullRe
 		app.Log.Info("review posted for %s#%d", app.Repo.FullName, number)
 	}
 	recordReviewedPR(ctx, app, number, posted.ID)
+	// The successful review covers this head; a failed run keeps the SHA
+	// recorded at enqueue time so the same head is not retried forever, and a
+	// manual `@bot review` remains the way to force a re-run.
+	app.Store.SetReviewedSHA(app.Repo.FullName, number, pr.Head.SHA)
 }
 
 // recordReviewedPR remembers the review a 👍 applies and posts the comment that

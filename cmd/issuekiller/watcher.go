@@ -131,6 +131,9 @@ type smeeEnvelope struct {
 
 type smeePayload struct {
 	Action string `json:"action"`
+	// Number is the top-level issue or pull request number. pull_request
+	// events carry it there instead of inside an issue object.
+	Number int `json:"number"`
 	Issue  struct {
 		Number int `json:"number"`
 	} `json:"issue"`
@@ -166,6 +169,12 @@ func dispatchSmee(ctx context.Context, app *AppContext, router *Router, envelope
 	var payload smeePayload
 	if err := json.Unmarshal(envelope.Body, &payload); err != nil {
 		log.Debug("smee: cannot parse body: %v", err)
+		return
+	}
+	// A pull_request event has no issue object, so it must be handled before
+	// the issue-number gate below drops it.
+	if envelope.Event == "pull_request" {
+		dispatchPullRequest(ctx, app, router, payload, log)
 		return
 	}
 	if payload.Issue.Number == 0 {
@@ -270,6 +279,27 @@ func dispatchSmee(ctx context.Context, app *AppContext, router *Router, envelope
 		Key:         "smee-" + firstNonEmpty(envelope.Delivery, fmt.Sprint(issue.UpdatedAt.UnixNano())),
 		DeliveryID:  envelope.Delivery,
 	})
+}
+
+// dispatchPullRequest starts the automatic review of a freshly submitted or
+// updated pull request. Only the number is trusted from the relay: the PR is
+// re-read from the API like every other event, so a compromised relay cannot
+// forge an author or a head SHA.
+func dispatchPullRequest(ctx context.Context, app *AppContext, router *Router, payload smeePayload, log *Logger) {
+	if payload.Number == 0 {
+		return
+	}
+	switch payload.Action {
+	case "opened", "reopened", "synchronize", "ready_for_review":
+	default:
+		return
+	}
+	pr, err := app.GH.GetPR(ctx, app.Repo.FullName, payload.Number)
+	if err != nil {
+		log.Warn("smee: fetch PR %d: %v", payload.Number, err)
+		return
+	}
+	router.enqueueAutoReview(ctx, app, pr)
 }
 
 func startSmee(ctx context.Context, app *AppContext, router *Router, channel string, log *Logger) func() {

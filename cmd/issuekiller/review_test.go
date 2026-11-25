@@ -7,7 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestResolveReviewCommand(t *testing.T) {
@@ -194,5 +196,178 @@ func TestCreatePRReview(t *testing.T) {
 	}
 	if len(payload.Comments) != 1 || payload.Comments[0].Path != "a.py" {
 		t.Fatalf("comments = %+v", payload.Comments)
+	}
+}
+
+// autoReviewPR builds a pull request for the auto-review tests.
+func autoReviewPR(number int, sha string, draft bool, author string) PullRequest {
+	pr := PullRequest{Number: number, State: "open", Draft: draft, User: User{Login: author}}
+	pr.Head.SHA = sha
+	return pr
+}
+
+// autoReviewRouter wires an app and router against a fake GitHub API. The
+// handler decides what a `GET /pulls/{n}` returns; a queued review job
+// re-fetches the PR and stops before the git-heavy doReviewPR when that
+// response is a closed or draft PR.
+func autoReviewRouter(t *testing.T, gh *GH) (*Router, *AppContext, *Store) {
+	t.Helper()
+	store := newTestStore(t)
+	app := &AppContext{
+		Repo:       RepoConfig{FullName: "acme/app", Name: "app", AutoReview: true},
+		GH:         gh,
+		Store:      store,
+		Log:        NewSilentLogger(),
+		AgentLogin: "bot",
+	}
+	router := NewRouter(&Config{PlanParallel: 1, ImplementParallel: 1},
+		map[string]*AppContext{"acme/app": app}, "bot", store, NewSilentLogger())
+	return router, app, store
+}
+
+// reviewJobRunning reports whether any auto or manual review job is queued or
+// active; the decision not to enqueue is synchronous, so this is deterministic.
+func reviewJobRunning(snap RouterSnapshot) bool {
+	for key := range snap.Active {
+		if strings.HasSuffix(key, "#review") {
+			return true
+		}
+	}
+	for key := range snap.Queued {
+		if strings.HasSuffix(key, "#review") {
+			return true
+		}
+	}
+	return false
+}
+
+func TestEnqueueAutoReview(t *testing.T) {
+	var prCalls int32
+	gh, _ := newFakeAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/repos/acme/app/pulls/5" {
+			// Every fetch here is a queued job re-reading the PR; a closed
+			// answer stops the job before doReviewPR and its git worktree.
+			atomic.AddInt32(&prCalls, 1)
+			_ = json.NewEncoder(w).Encode(PullRequest{Number: 5, State: "closed"})
+			return
+		}
+		_, _ = w.Write([]byte("{}"))
+	})
+	router, app, store := autoReviewRouter(t, gh)
+	ctx := context.Background()
+
+	router.enqueueAutoReview(ctx, app, autoReviewPR(5, "abc123", false, "human"))
+	if got := store.Issue("acme/app", 5).ReviewedSHA; got != "abc123" {
+		t.Fatalf("ReviewedSHA = %q, want the queued head", got)
+	}
+	router.waitInactive(ctx, "acme/app#5#review", 5*time.Second)
+	if got := atomic.LoadInt32(&prCalls); got != 1 {
+		t.Fatalf("review job made %d PR requests, want 1", got)
+	}
+
+	// The same head again is a redelivery or a repeated poll, not a new job.
+	router.enqueueAutoReview(ctx, app, autoReviewPR(5, "abc123", false, "human"))
+	if reviewJobRunning(router.Snapshot()) {
+		t.Fatal("the same head must not enqueue a second review")
+	}
+
+	// A new push moves the head and reviews again.
+	router.enqueueAutoReview(ctx, app, autoReviewPR(5, "def456", false, "human"))
+	router.waitInactive(ctx, "acme/app#5#review", 5*time.Second)
+	if got := atomic.LoadInt32(&prCalls); got != 2 {
+		t.Fatalf("review jobs made %d PR requests, want 2", got)
+	}
+
+	// Drafts, the bot's own PRs and closed PRs never queue.
+	router.enqueueAutoReview(ctx, app, autoReviewPR(5, "xyz999", true, "human"))
+	router.enqueueAutoReview(ctx, app, autoReviewPR(5, "xyz999", false, "bot"))
+	router.enqueueAutoReview(ctx, app, PullRequest{Number: 5, State: "closed"})
+	if got := store.Issue("acme/app", 5).ReviewedSHA; got != "def456" {
+		t.Fatalf("ReviewedSHA = %q, want the last queued head def456", got)
+	}
+	if reviewJobRunning(router.Snapshot()) {
+		t.Fatal("draft, self-authored and closed PRs must not enqueue")
+	}
+
+	// A repo that opted out never queues, even for a fresh PR.
+	app.Repo.AutoReview = false
+	router.enqueueAutoReview(ctx, app, autoReviewPR(9, "first", false, "human"))
+	app.Repo.AutoReview = true
+	if got := store.Issue("acme/app", 9).ReviewedSHA; got != "" {
+		t.Fatalf("opted-out repo recorded ReviewedSHA %q", got)
+	}
+	if reviewJobRunning(router.Snapshot()) {
+		t.Fatal("an opted-out repo must not enqueue")
+	}
+}
+
+func TestHookEventsIncludePullRequest(t *testing.T) {
+	// The pull_request event feeds the automatic review; hooks created by an
+	// older build are reconciled by missingHookEvents (TestMissingHookEvents).
+	seen := map[string]bool{}
+	for _, event := range hookEvents {
+		seen[event] = true
+	}
+	if !seen["pull_request"] {
+		t.Fatalf("hookEvents = %v, want pull_request", hookEvents)
+	}
+}
+
+func TestDispatchSmeePullRequest(t *testing.T) {
+	var prCalls int32
+	gh, _ := newFakeAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/repos/acme/app/pulls/5" {
+			// Odd fetches are an event's own read and see the open PR; even
+			// fetches are a queued job's re-read and see a draft, which stops
+			// the job before doReviewPR and its git worktree.
+			if atomic.AddInt32(&prCalls, 1)%2 == 1 {
+				_ = json.NewEncoder(w).Encode(autoReviewPR(5, "abc123", false, "human"))
+				return
+			}
+			_ = json.NewEncoder(w).Encode(autoReviewPR(5, "abc123", true, "human"))
+			return
+		}
+		_, _ = w.Write([]byte("{}"))
+	})
+	router, app, store := autoReviewRouter(t, gh)
+	log := NewSilentLogger()
+	ctx := context.Background()
+	opened := smeeEnvelope{Event: "pull_request", Body: json.RawMessage(`{"action":"opened","number":5,"pull_request":{"number":5}}`)}
+
+	dispatchSmee(ctx, app, router, opened, log)
+	router.waitInactive(ctx, "acme/app#5#review", 5*time.Second)
+	if got := store.Issue("acme/app", 5).ReviewedSHA; got != "abc123" {
+		t.Fatalf("ReviewedSHA = %q, want the fetched head", got)
+	}
+	if got := atomic.LoadInt32(&prCalls); got != 2 {
+		t.Fatalf("PR requests = %d, want 2 (event fetch + job fetch)", got)
+	}
+
+	// A redelivery of the same event (or a synchronize with the same head)
+	// re-fetches the PR but must not start a second review.
+	redelivered := smeeEnvelope{Event: "pull_request", Body: json.RawMessage(`{"action":"synchronize","number":5}`)}
+	dispatchSmee(ctx, app, router, redelivered, log)
+	if reviewJobRunning(router.Snapshot()) {
+		t.Fatal("a repeated delivery must not enqueue a second review")
+	}
+	if got := atomic.LoadInt32(&prCalls); got != 3 {
+		t.Fatalf("PR requests = %d, want 3 after the redelivery", got)
+	}
+
+	// Actions that do not change the reviewable head are ignored outright.
+	for _, action := range []string{"closed", "assigned", "labeled", "edited"} {
+		dispatchSmee(ctx, app, router, smeeEnvelope{
+			Event: "pull_request",
+			Body:  json.RawMessage(`{"action":"` + action + `","number":5}`),
+		}, log)
+	}
+	if got := atomic.LoadInt32(&prCalls); got != 3 {
+		t.Fatalf("ignored actions made %d PR requests, want none", got)
+	}
+
+	// A payload without a top-level number cannot be routed and is dropped.
+	dispatchSmee(ctx, app, router, smeeEnvelope{Event: "pull_request", Body: json.RawMessage(`{"action":"opened"}`)}, log)
+	if reviewJobRunning(router.Snapshot()) {
+		t.Fatal("a number-less pull_request event must be dropped")
 	}
 }

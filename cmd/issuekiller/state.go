@@ -38,33 +38,36 @@ type Shot struct {
 }
 
 type IssueState struct {
-	Phase             string        `json:"phase"`
-	Plan              string        `json:"plan,omitempty"`
-	PlanCommentID     int64         `json:"planCommentId,omitempty"`
-	SessionID         string        `json:"sessionId,omitempty"`
-	LastCommentID     int64         `json:"lastCommentId,omitempty"`
-	ProcessedComments []int64       `json:"processedComments,omitempty"`
-	ProcessedFeedback []int64       `json:"processedFeedback,omitempty"`
-	ExtraNotes        string        `json:"extraNotes,omitempty"`
-	Branch            string        `json:"branch,omitempty"`
-	Worktree          string        `json:"worktree,omitempty"`
-	PRNumber          int           `json:"prNumber,omitempty"`
-	PRURL             string        `json:"prUrl,omitempty"`
-	PRCommentID       int64         `json:"prCommentId,omitempty"`
-	ReviewID          int64         `json:"reviewId,omitempty"`
-	ReviewCommentID   int64         `json:"reviewCommentId,omitempty"`
-	Checks            []CheckResult `json:"checks,omitempty"`
-	Screenshots       []Shot        `json:"screenshots,omitempty"`
-	BlockedReason     string        `json:"blockedReason,omitempty"`
-	StatusCommentID   int64         `json:"statusCommentId,omitempty"`
-	BlockedByCI       bool          `json:"blockedByCI,omitempty"`
-	Issue             *IssueMeta    `json:"issue,omitempty"`
-	CreatedAt         string        `json:"createdAt,omitempty"`
-	UpdatedAt         string        `json:"updatedAt,omitempty"`
-	StartedAt         string        `json:"startedAt,omitempty"`
-	MergedAt          string        `json:"mergedAt,omitempty"`
-	CancelledAt       string        `json:"cancelledAt,omitempty"`
-	IssueClosed       bool          `json:"issueClosed,omitempty"`
+	Phase             string  `json:"phase"`
+	Plan              string  `json:"plan,omitempty"`
+	PlanCommentID     int64   `json:"planCommentId,omitempty"`
+	SessionID         string  `json:"sessionId,omitempty"`
+	LastCommentID     int64   `json:"lastCommentId,omitempty"`
+	ProcessedComments []int64 `json:"processedComments,omitempty"`
+	ProcessedFeedback []int64 `json:"processedFeedback,omitempty"`
+	ExtraNotes        string  `json:"extraNotes,omitempty"`
+	Branch            string  `json:"branch,omitempty"`
+	Worktree          string  `json:"worktree,omitempty"`
+	PRNumber          int     `json:"prNumber,omitempty"`
+	PRURL             string  `json:"prUrl,omitempty"`
+	PRCommentID       int64   `json:"prCommentId,omitempty"`
+	ReviewID          int64   `json:"reviewId,omitempty"`
+	ReviewCommentID   int64   `json:"reviewCommentId,omitempty"`
+	// ReviewedSHA is the PR head an automatic review already covered, so a
+	// redelivered webhook or the next poll cannot restart it.
+	ReviewedSHA     string        `json:"reviewedSha,omitempty"`
+	Checks          []CheckResult `json:"checks,omitempty"`
+	Screenshots     []Shot        `json:"screenshots,omitempty"`
+	BlockedReason   string        `json:"blockedReason,omitempty"`
+	StatusCommentID int64         `json:"statusCommentId,omitempty"`
+	BlockedByCI     bool          `json:"blockedByCI,omitempty"`
+	Issue           *IssueMeta    `json:"issue,omitempty"`
+	CreatedAt       string        `json:"createdAt,omitempty"`
+	UpdatedAt       string        `json:"updatedAt,omitempty"`
+	StartedAt       string        `json:"startedAt,omitempty"`
+	MergedAt        string        `json:"mergedAt,omitempty"`
+	CancelledAt     string        `json:"cancelledAt,omitempty"`
+	IssueClosed     bool          `json:"issueClosed,omitempty"`
 }
 
 type RepoMeta struct {
@@ -200,6 +203,23 @@ func (s *Store) SetPRMeta(fullName string, number int, meta *IssueMeta) {
 		repo.Issues[key] = issue
 	}
 	issue.Issue = meta
+	issue.UpdatedAt = nowISO()
+	_ = s.SaveLocked()
+}
+
+// SetReviewedSHA records the pull request head a review covers. Like SetPRMeta
+// it keeps a pull request out of the task phase machine.
+func (s *Store) SetReviewedSHA(fullName string, number int, sha string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	repo := s.repoLocked(fullName)
+	key := itoa(number)
+	issue := repo.Issues[key]
+	if issue == nil {
+		issue = &IssueState{Phase: "", CreatedAt: nowISO()}
+		repo.Issues[key] = issue
+	}
+	issue.ReviewedSHA = sha
 	issue.UpdatedAt = nowISO()
 	_ = s.SaveLocked()
 }

@@ -121,6 +121,7 @@ type PullRequest struct {
 	Number              int    `json:"number"`
 	HTMLURL             string `json:"html_url"`
 	State               string `json:"state"`
+	Draft               bool   `json:"draft"`
 	Title               string `json:"title"`
 	Body                string `json:"body"`
 	Mergeable           *bool  `json:"mergeable"`
@@ -417,7 +418,10 @@ func hasAgentMarker(body string) bool {
 		strings.Contains(body, legacyAgentCommentMarker)
 }
 
-var hookEvents = []string{"issues", "issue_comment", "reaction", "pull_request_review", "pull_request_review_comment"}
+// hookEvents lists the webhook events the daemon understands. pull_request
+// feeds the automatic review of freshly submitted PRs; missingHookEvents adds
+// it to hooks created by older builds on the next ensureSmeeHook pass.
+var hookEvents = []string{"issues", "issue_comment", "reaction", "pull_request", "pull_request_review", "pull_request_review_comment"}
 
 func (g *GH) PostComment(ctx context.Context, fullName string, number int, body string) (Comment, error) {
 	var comment Comment

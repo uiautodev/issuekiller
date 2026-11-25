@@ -246,7 +246,7 @@ Optional: `pollIntervalSec` (30), `webhook` (true), `maxFixRounds` (3),
 `selfUpdate` (false), `followMaster` (false), `updateProxy` (empty = direct only), `webPort` (0 = off;
 `8787` serves the dashboard on 127.0.0.1), `planTimeoutMin` (15),
 `implementTimeoutMin` (60), `worktreeRoot` (state dir), `language` (`auto`),
-`mode` (`auto`).
+`mode` (`auto`), `autoReview` per repository (**true**).
 
 `updateProxy` is a download mirror prefix for release assets, not an HTTP
 proxy: when the direct download from github.com fails, the daemon retries
@@ -274,8 +274,37 @@ falls back to the plan, so an issue never gets stuck; in `auto` an explicit
 rejected when the config loads. `bug`-labelled issues always skip the plan.
 
 Per-repo overrides: the `repos` object form can set `codingAgent`, `model`,
-`approvers`, `worktreeRoot`, `language`, `mode`, or a `release` block for one
-repository.
+`approvers`, `worktreeRoot`, `language`, `mode`, `autoReview`, or a `release`
+block for one repository.
+
+### 4.1.1 Automatic pull request review (`autoReview`, per repo)
+
+```json
+{
+  "repos": {
+    "me/app": { "autoReview": false }
+  }
+}
+```
+
+| key | default | meaning |
+| --- | --- | --- |
+| `autoReview` | `true` | review every new pull-request head without a command |
+
+A watched repository reviews pull requests it did not open itself: when a PR
+is opened, reopened, pushed to (synchronize) or marked ready for review, the
+daemon reviews the new head exactly like `@agent review` — same plan-queue
+slot, same review comment, same 👍-to-apply prompt — and the PR author gets an
+👀 reaction while it runs. Draft PRs, the bot's own PRs and a head that was
+already reviewed are skipped; a failed review of one head is not retried
+automatically (a new push or the manual `@agent review` command is the
+retry). Disabling costs nothing extra: a repo with `autoReview: false` never
+fetches the pull request itself, and the webhook `pull_request` event is
+ignored. Every new PR head consumes one full agent run, so keep an eye on the
+token and agent quota on busy repositories. The very first poll of a newly
+watched repository (no stored poll timestamp yet) counts every open PR as
+updated and reviews each current head once; afterwards only PRs that changed
+since the previous poll are picked up.
 
 The running daemon watches the config file with the OS notification API
 (inotify / kqueue via fsnotify, debounced, with a 30 s safety poll). A valid save
@@ -283,7 +312,7 @@ triggers a graceful re-exec: it waits for running jobs, then replaces itself
 with the new config, keeping the PID and the lock. An invalid save is logged
 and ignored, so the old settings stay active.
 
-### 4.1.1 Periodic releases (optional, per repo)
+### 4.1.2 Periodic releases (optional, per repo)
 
 ```json
 {

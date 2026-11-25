@@ -1,6 +1,9 @@
 {
   "repos": [
-    "codeskyblue/weektodo"
+    {
+      "repo": "codeskyblue/weektodo",
+      "autoReview": true
+    }
   ],
   "codingAgent": "opencode",
   "model": "magpie/group/deepseek",

@@ -188,7 +188,9 @@ dependencies.
 `SessionID` (coding-agent session), `Branch`, `Worktree`, `PRNumber`, `PRURL`,
 `PRCommentID` (the 👍 target), `StatusCommentID` (the last “needs you”
 comment, also a 👍 target), `Checks`, `Screenshots`, `BlockedReason`,
-`ProcessedComments`/`ProcessedFeedback`, `MergedAt`/`CancelledAt`.
+`ProcessedComments`/`ProcessedFeedback`, `MergedAt`/`CancelledAt`,
+`ReviewedSHA` (the PR head an automatic review already covered; a pull
+request tracked only for review keeps phase empty — it is not a task).
 
 | phase | meaning | who sets it |
 | --- | --- | --- |
@@ -240,6 +242,22 @@ Other rules:
 - `review` is the only command that targets a PR directly. It works for any PR
   in a watched repo, not only the daemon's own, and runs on the plan queue with
   its own job key (`<repo>#<pr>#review`).
+- **Automatic review** (`enqueueAutoReview`) runs that same stage without a
+  command. The webhook delivers `pull_request` events (`opened`, `reopened`,
+  `synchronize`, `ready_for_review`; `dispatchPullRequest` re-reads the PR from
+  the API first), and `PollOnce` is the fallback when the event was lost: it
+  lists issues and PRs (`ListIssuesAndPRs`) and, for every updated PR in a repo
+  with `autoReview` (default **on**; `autoReview: false` opts out per repo),
+  fetches the PR and calls the same entry. Drafts, PRs authored by the bot
+  itself and a head SHA equal to the stored `ReviewedSHA` are skipped. The SHA
+  is recorded when the review is queued and again when `doReviewPR` succeeds,
+  so a failed review of one head is not retried on every poll — a new push
+  (new SHA) or a manual `@bot review` is the retry. The bot's own PRs are
+  covered by the issue flow's CI gate instead. PR comments are not scanned by
+  the poller: they still arrive through `issue_comment` events, so a PR costs
+  one `GET /pulls/{n}` per poll at most (only while it changes). The first
+  poll of a repository without a stored `LastPollAt` has no `since` window and
+  therefore reviews the current head of every open PR once.
 - A non-command mention from an approver on a pull request the daemon does not
   own is a **modification request** (`doModifyPR`): edit the PR head, run the
   checks and push back to the head branch. Same-repository branches are pushed
@@ -300,7 +318,8 @@ Rules that keep it safe:
 - A job key is `<repo>#<issue>` (dedupe: a second command for a busy issue is
   skipped). CI jobs use `<repo>#<issue>#ci`; the plan-skipping starts use
   `<repo>#<issue>#bug` and `<repo>#<issue>#build`, so they still run on the
-  work queue under the implementation slot.
+  work queue under the implementation slot; PR reviews (manual and automatic)
+  use `<repo>#<pr>#review` on the plan queue.
 - `cancelActive` cancels every key from `issueJobKeys` (plan/work, CI and the
   plan-skipping `#bug`/`#build` starts); `HandleClosed` waits for all of them
   before the worktree is removed, so cleanup never races a running agent.
@@ -361,8 +380,9 @@ at a file or line outside the diff cannot be attached inline (GitHub answers
 422 “Path could not be resolved”), so they are listed in the review body
 instead. It then posts a “Review 已提交” comment and stores its id plus the
 review id in the PR's `IssueState`, so a 👍 on that comment applies the
-findings through `doModifyPR`. Nothing is ever pushed by the review itself and
-the worktree is removed afterwards.
+findings through `doModifyPR`. On success it also records the reviewed head in
+`ReviewedSHA`, which is what deduplicates the automatic reviews. Nothing is
+ever pushed by the review itself and the worktree is removed afterwards.
 
 **Merge PR** (`doMergePR`) — lands a PR the daemon does not own: fetch the head
 into a branch worktree, resolve conflicts with `conflict_fix.md` (merge the base,
@@ -480,8 +500,11 @@ there is no tag yet, and publishes with `POST /repos/{repo}/releases`
 (`tag_name`, `name`, `body`, `target_commitish`, never a draft).
 
 Hooks are created per repo (`hookEvents`): `issues`, `issue_comment`,
-`reaction`, `pull_request_review`, `pull_request_review_comment`. When webhooks
-are unavailable the poller is the fallback; both funnel into `Router.Handle*`.
+`reaction`, `pull_request`, `pull_request_review`,
+`pull_request_review_comment`; `missingHookEvents` adds `pull_request` (and
+any later event) to a hook created by an older build on the next
+`ensureSmeeHook` pass. When webhooks are unavailable the poller is the
+fallback; both funnel into `Router.Handle*`.
 
 ## 12. Git and worktrees (`git.go`)
 
@@ -541,9 +564,11 @@ mirror is ignored), `worktreeRoot` = state dir, `language` `auto` (the coding
 agent writes in the issue's or PR's language; a language tag forces one and is
 passed to the prompts as `{{LANGUAGE}}`), `mode` `auto` (`plan` always posts a
 plan comment, `build` implements directly, `auto` lets the coding agent triage;
-an unknown mode is rejected at load time). `repos` also accepts an object for
+an unknown mode is rejected at load time), `autoReview` **true** per repo (the
+automatic PR review; an explicit `autoReview: false` opts a repo out).
+`repos` also accepts an object for
 per-repo `codingAgent`/`model`/`approvers`/`worktreeRoot`/`language`/`mode`/
-`release`.
+`release`/`autoReview`.
 
 `release` is an optional per-repo block — `enabled` (false), `intervalDays`
 (1) and `time` (`09:00`, local `HH:MM`; an invalid value fails the load with an
@@ -764,26 +789,26 @@ keeps tests quiet. Notable coverage:
 | `waitforchecks_test.go` | verdict, fail-fast, stuck, required checks, base flags, approval, log report |
 | `conflict_test.go` | conflict detection, merge-API error classification, `conflictedFiles` on a real repo |
 | `cirepair_test.go` | worktree-ahead detection used to publish a stranded repair commit |
-| `review_test.go` | review command parsing, `review.json` loading, inline filtering, fallback body, review API payload |
+| `review_test.go` | review command parsing, `review.json` loading, inline filtering, fallback body, review API payload, the auto-review gate (draft/self/same head/opted-out repo), the `pull_request` webhook delivery |
 | `modifypr_test.go` | which PR heads can be pushed (same repo, fork with allow-edits-by-maintainers) |
 | `comment_edit_test.go` | edited comments are reprocessed, plain repeats stay deduped |
 | `approve_phase_test.go` | 👍 and merge move the phase as soon as they are accepted |
 | `messages_test.go` | scaffolding catalogs, `app.text` resolution, language detection |
 | `reactions_test.go` | polled 👍 on the review prompt (approver only, consumed once) |
 | `reaction_ack_test.go` | 👀 acknowledgment, status comment id remembered, 👍 on it retries |
-| `poll_scan_test.go` | periodic scans start from tracked issues and cost no request when nothing is pending |
+| `poll_scan_test.go` | periodic scans start from tracked issues and cost no request when nothing is pending; the poll auto-review fallback enqueues once per head and is skipped when the repo opts out |
 | `blocked_ci_test.go` | green-check detection, auto-resume of CI-blocked tasks, other reasons untouched |
 | `router_ci_test.go` | the CI queue does not block work; cancel stops CI jobs |
 | `gh_test.go` | label transitions and GitHub helpers |
 | `release_test.go` | version tag parsing, bump rules, commit classification, due check (calendar days and configured time), time parsing/defaults, release request body, disabled/not-due/no-commit skips |
-| `main_test.go` | proxy/env parsing, repo normalization (names, objects, object arrays), mentions and commands, closable phases, state-dir adoption of `~/.gh-issue-killer`, legacy env fallbacks |
+| `main_test.go` | proxy/env parsing, repo normalization (names, objects, object arrays), mentions and commands, closable phases, state-dir adoption of `~/.gh-issue-killer`, legacy env fallbacks, the `autoReview` default and opt-out |
 | `prompts_test.go` | every embedded prompt loads and keeps its placeholders |
 | `triage_test.go` | mode normalization, plan/build routing, triage answer parsing, explicit plan requests, direct-build start |
 | `runner_test.go` | per-agent argv construction, overlong-record draining, stage timeout and stall kill |
 | `shots_test.go` | before/after composition and screenshot markdown |
 | `plan_test.go` | plan text trimming |
 | `watch_test.go` | config reload fires on valid edits, ignores invalid ones |
-| `watcher_test.go` | `Store` round-trip |
+| `watcher_test.go` | `Store` round-trip, `ReviewedSHA` persistence for auto-review dedup |
 | `web_test.go` | dashboard snapshot only lists tracked tasks, `/api/open-url` validation and browser handoff, embedded SPA serving (index, hashed assets, cache headers, 404s, SPA fallback, unbuilt-frontend hint) |
 | `oauth_test.go` | Device Flow pending/slow_down/expired, token file 0600, refresh success/failure, credential precedence, 401 retry, login/paste endpoints, login panel markup |
 | `openurl_test.go` | per-platform browser command, no shell, injected runner |
