@@ -54,12 +54,14 @@
 		releaseEnabled: boolean;
 		releaseInterval: string;
 		releaseTime: string;
+		releaseVPrefix: boolean;
 	}
 
 	interface ReleaseValue {
 		enabled: boolean;
 		intervalDays: number;
 		time: string;
+		vPrefix: boolean;
 	}
 
 	// HH:MM in 24-hour form; the browser's time input only emits this, but a
@@ -238,7 +240,7 @@
 	function releaseDefaults(): ReleaseValue {
 		const defaults =
 			(configDefaults.release as
-				| { enabled?: boolean; intervalDays?: number; time?: string }
+				| { enabled?: boolean; intervalDays?: number; time?: string; vPrefix?: boolean }
 				| undefined) || {};
 		const interval = Number(defaults.intervalDays);
 		return {
@@ -247,7 +249,8 @@
 			time:
 				typeof defaults.time === 'string' && RELEASE_TIME.test(defaults.time)
 					? defaults.time
-					: RELEASE_DEFAULT_TIME
+					: RELEASE_DEFAULT_TIME,
+			vPrefix: defaults.vPrefix !== false
 		};
 	}
 
@@ -265,7 +268,8 @@
 			time:
 				typeof release.time === 'string' && RELEASE_TIME.test(release.time)
 					? release.time
-					: base.time
+					: base.time,
+			vPrefix: typeof release.vPrefix === 'boolean' ? release.vPrefix : base.vPrefix
 		};
 	}
 
@@ -273,7 +277,8 @@
 		return (
 			value.enabled ||
 			Number(value.intervalDays) !== defaults.intervalDays ||
-			value.time !== defaults.time
+			value.time !== defaults.time ||
+			value.vPrefix !== defaults.vPrefix
 		);
 	}
 
@@ -288,7 +293,8 @@
 			language: repoString(doc.repos, name, 'language'),
 			releaseEnabled: release.enabled,
 			releaseInterval: String(release.intervalDays),
-			releaseTime: release.time
+			releaseTime: release.time,
+			releaseVPrefix: release.vPrefix
 		};
 	}
 
@@ -296,7 +302,8 @@
 		return {
 			enabled: draft.releaseEnabled,
 			intervalDays: Number(draft.releaseInterval),
-			time: draft.releaseTime
+			time: draft.releaseTime,
+			vPrefix: draft.releaseVPrefix
 		};
 	}
 
@@ -366,6 +373,9 @@
 			// The default time stays implicit; only a deliberate schedule is
 			// written, so later default changes still reach these repos.
 			if (release.time && release.time !== defaults.time) value.time = release.time;
+			// Same for the tag prefix: only a repo that turned the v off
+			// carries the key, so the default stays implicit.
+			if (release.vPrefix !== defaults.vPrefix) value.vPrefix = release.vPrefix;
 			entry.release = value;
 		}
 	}
@@ -930,7 +940,10 @@
 									</div>
 								</div>
 
-								<div class="flex flex-col gap-2 border-t border-border/60 pt-3">
+								<div
+									class="flex flex-col gap-2 border-t border-border/60 pt-3"
+									data-testid="repo-release-card"
+								>
 									<div class="flex flex-wrap items-baseline gap-2.5">
 										<span class="text-xs tracking-[0.04em] text-muted-foreground">
 											{t('settings.release')}
@@ -946,6 +959,15 @@
 												bind:checked={drafts[selectedRepo].releaseEnabled}
 											/>
 											{t('settings.releaseEnabled')}
+										</label>
+										<label class="flex items-center gap-1.5 pb-1 text-2xs text-muted-foreground">
+											<input
+												type="checkbox"
+												class="accent-phase-work"
+												data-testid="repo-release-vprefix"
+												bind:checked={drafts[selectedRepo].releaseVPrefix}
+											/>
+											{t('settings.releaseVPrefix')}
 										</label>
 										<label class="flex flex-col gap-1 text-2xs tracking-[0.03em] text-muted-foreground">
 											{t('settings.releaseInterval')}

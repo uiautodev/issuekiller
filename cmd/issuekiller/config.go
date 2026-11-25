@@ -93,6 +93,10 @@ type ReleaseConfig struct {
 	// default is 09:00 so a scheduled release lands at the start of a workday
 	// instead of whenever the daemon happened to start.
 	Time string
+	// VPrefix decides whether tags are vMAJOR.MINOR.PATCH or MAJOR.MINOR.PATCH.
+	// It defaults to true; repositories that already tag without the v keep
+	// their sequence by switching it off.
+	VPrefix bool
 }
 
 type Config struct {
@@ -135,13 +139,17 @@ type repoOptions struct {
 
 // releaseOptions mirrors ReleaseConfig in the config file. intervalDays is a
 // minimum gap between checks: the tick itself is hourly. time is the local
-// HH:MM a release publishes at; empty means defaultReleaseTime. Older configs
+// HH:MM a release publishes at; empty means defaultReleaseTime. vPrefix is an
+// optional tag prefix switch, true (vX.Y.Z) unless set to false. Older configs
 // may still carry bugBump/featureBump; the decoder ignores them because the
 // bump is conventional.
 type releaseOptions struct {
 	Enabled      bool   `json:"enabled"`
 	IntervalDays int    `json:"intervalDays"`
 	Time         string `json:"time"`
+	// VPrefix is a pointer so an absent key (true, the default) stays
+	// distinguishable from an explicit opt-out.
+	VPrefix *bool `json:"vPrefix"`
 }
 
 type rawConfig struct {
@@ -293,11 +301,15 @@ func normalizeIssueMode(value string) (string, error) {
 const defaultReleaseTime = "09:00"
 
 // normalizeRelease fills in the optional per-repo release block. One day
-// between checks is the default; the bump part is not configurable because it
-// follows the conventional commits in the batch. An unusable time is a load
-// error instead of a silent fallback: a typo must not move a release by hours.
+// between checks and a v tag prefix are the defaults; the bump part is not
+// configurable because it follows the conventional commits in the batch. An
+// unusable time is a load error instead of a silent fallback: a typo must not
+// move a release by hours.
 func normalizeRelease(opts releaseOptions) (ReleaseConfig, error) {
-	cfg := ReleaseConfig{Enabled: opts.Enabled, IntervalDays: opts.IntervalDays}
+	cfg := ReleaseConfig{Enabled: opts.Enabled, IntervalDays: opts.IntervalDays, VPrefix: true}
+	if opts.VPrefix != nil {
+		cfg.VPrefix = *opts.VPrefix
+	}
 	if cfg.IntervalDays < 1 {
 		cfg.IntervalDays = 1
 	}

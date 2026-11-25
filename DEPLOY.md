@@ -321,7 +321,8 @@ and ignored, so the old settings stay active.
       "release": {
         "enabled": true,
         "intervalDays": 1,
-        "time": "09:00"
+        "time": "09:00",
+        "vPrefix": true
       }
     }
   }
@@ -333,14 +334,15 @@ and ignored, so the old settings stay active.
 | `enabled` | `false` | publish releases for this repository |
 | `intervalDays` | `1` | minimum days between checks |
 | `time` | `"09:00"` | local publish time of day (`HH:MM`, daemon host time zone) |
+| `vPrefix` | `true` | write `v1.2.3` tags; `false` writes bare `1.2.3` tags |
 
 The dashboard shows the same block: **Settings → Repositories** picks a project
-from the dropdown and gives it a card with the release switch, the interval and
-the time; saving writes them back into `repos` (keeping `codingAgent`, `model`,
-`language` and the other overrides) before restarting the daemon. A project left
-on the default values writes no `release` block, so the file stays free of
-no-op blocks. An unusable `time` is rejected at load time and by the dashboard
-save instead of falling back silently.
+from the dropdown and gives it a card with the release switch, the interval, the
+time and the `v` prefix switch; saving writes them back into `repos` (keeping
+`codingAgent`, `model`, `language` and the other overrides) before restarting the
+daemon. A project left on the default values writes no `release` block, so the
+file stays free of no-op blocks. An unusable `time` is rejected at load time and
+by the dashboard save instead of falling back silently.
 
 The same project card sets that repository's coding agent, model and language.
 Each has a "follow global" choice that removes the key instead of pinning
@@ -354,8 +356,12 @@ The bump part is not configurable because it follows the conventional commits:
 a `feat`/`feature` subject (including `feat(scope):`) bumps the minor part,
 anything else bumps the patch part. A **major** release is a deliberate human
 decision and is never published automatically — cut the `vX.0.0` tag yourself
-when you mean it. The newest `vMAJOR.MINOR.PATCH` tag is the version source. A
-repository without a version tag publishes `v0.1.0` as its first release, since
+when you mean it. The newest `MAJOR.MINOR.PATCH` tag is the version source,
+with or without a leading `v`; `vPrefix` decides which form the daemon writes
+(`v1.2.3` by default, `1.2.3` with `false`). Because both forms are parsed,
+turning the prefix on or off keeps counting from the tags that already exist
+instead of starting over. A repository without a version tag publishes
+`v0.1.0` (or `0.1.0` when `vPrefix` is false) as its first release, since
 a bump describes a change relative to a published version. A check lists the
 commits on the default branch since that tag, bumps once, then creates the tag
 and the release on the default branch. The release body lists those commit

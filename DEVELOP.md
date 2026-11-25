@@ -571,12 +571,15 @@ per-repo `codingAgent`/`model`/`approvers`/`worktreeRoot`/`language`/`mode`/
 `release`/`autoReview`.
 
 `release` is an optional per-repo block — `enabled` (false), `intervalDays`
-(1) and `time` (`09:00`, local `HH:MM`; an invalid value fails the load with an
-actionable error rather than silently moving the schedule). The bump part is not
-a config key: `release.go` bumps minor when the batch
+(1), `time` (`09:00`, local `HH:MM`; an invalid value fails the load with an
+actionable error rather than silently moving the schedule) and `vPrefix` (true;
+`false` publishes bare `MAJOR.MINOR.PATCH` tags instead of
+`vMAJOR.MINOR.PATCH`). The bump part is not a config key: `release.go` bumps
+minor when the batch
 contains a `feat`/`feature` commit subject and patch otherwise, and never
-publishes a major automatically. The newest `vMAJOR.MINOR.PATCH` tag is the
-version source; a repo without one publishes `v0.1.0` first (the bump rule only
+publishes a major automatically. The newest version tag is the
+version source, whichever prefix it uses; a repo without one publishes
+`v0.1.0` first (`0.1.0` with `vPrefix: false`; the bump rule only
 applies afterwards). Older files may still carry `bugBump`/`featureBump`; the
 decoder ignores them and a dashboard save drops them. Publishing creates the tag
 and the release in one call (`target_commitish` = default branch), so the token
@@ -584,11 +587,13 @@ needs `contents: write`, which the push-capable bot token already has.
 
 The dashboard's settings panel edits the same block: `/api/config` sends the
 one-day/09:00 defaults as `defaults.release` and renders one row per repo with
-the switch, the interval and the time; the PUT rejects `intervalDays` below 1
-(or a non-integer) and a `time` that is not `HH:MM` before the temp-file
-`loadConfig`, instead of letting the loader clamp or fall back, and strips the
+the switch, the interval, the time and the `v` prefix switch; the PUT rejects
+`intervalDays` below 1 (or a non-integer), a `time` that is not `HH:MM` and a
+non-boolean `vPrefix` before the temp-file `loadConfig`, instead of letting the
+loader clamp or fall back, and strips the
 removed bump keys. An empty `time` means “use the default” and is dropped, like
-a null; a row left off with the defaults is removed from the saved file.
+a null; `vPrefix` is written only when it differs from the default, like the
+time, and a row left off with the defaults is removed from the saved file.
 `repos` may be an array of names, an
 array of objects (`{"repo": "owner/name", ...overrides}`) or a keyed object; the
 panel keeps the existing shape and the overrides of repos that stay.

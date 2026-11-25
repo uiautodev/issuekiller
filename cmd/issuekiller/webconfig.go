@@ -133,6 +133,7 @@ func (w *webServer) configDefaults() map[string]any {
 			"enabled":      release.Enabled,
 			"intervalDays": release.IntervalDays,
 			"time":         release.Time,
+			"vPrefix":      release.VPrefix,
 		},
 	}
 }
@@ -362,6 +363,13 @@ func normalizeReleaseBlock(entry map[string]any) error {
 			delete(release, "enabled")
 		} else if _, ok := raw.(bool); !ok {
 			return errors.New("release.enabled must be true or false")
+		}
+	}
+	if raw, ok := release["vPrefix"]; ok {
+		if raw == nil {
+			delete(release, "vPrefix")
+		} else if _, ok := raw.(bool); !ok {
+			return errors.New("release.vPrefix must be true or false")
 		}
 	}
 	if len(release) == 0 {

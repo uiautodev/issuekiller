@@ -101,11 +101,12 @@ func TestWebConfigDefaultsIncludeRelease(t *testing.T) {
 	if !ok {
 		t.Fatalf("defaults.release = %#v", defaults["release"])
 	}
-	want := ReleaseConfig{Enabled: false, IntervalDays: 1, Time: "09:00"}
+	want := ReleaseConfig{Enabled: false, IntervalDays: 1, Time: "09:00", VPrefix: true}
 	got := ReleaseConfig{
 		Enabled:      release["enabled"] == true,
 		IntervalDays: release["intervalDays"].(int),
 		Time:         release["time"].(string),
+		VPrefix:      release["vPrefix"] == true,
 	}
 	if got != want {
 		t.Fatalf("defaults.release = %+v, want %+v", got, want)
@@ -131,7 +132,7 @@ func TestWebConfigSavesReleaseObjectForm(t *testing.T) {
 		t.Fatalf("repos = %+v", cfg.Repos)
 	}
 	repo := cfg.Repos[0]
-	want := ReleaseConfig{Enabled: true, IntervalDays: 7, Time: "18:30"}
+	want := ReleaseConfig{Enabled: true, IntervalDays: 7, Time: "18:30", VPrefix: true}
 	if repo.Release != want {
 		t.Fatalf("release = %+v, want %+v", repo.Release, want)
 	}
@@ -156,6 +157,45 @@ func TestWebConfigSavesReleaseObjectForm(t *testing.T) {
 	}
 }
 
+func TestWebConfigSavesReleaseVPrefix(t *testing.T) {
+	web, path := newConfigTestWeb(t)
+	body := `{"config":{"repos":{"o/r":{"release":{"enabled":true,"vPrefix":false}}}}}`
+	recorder := putConfig(t, web, body, "")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("saved config does not load: %v", err)
+	}
+	if got := cfg.Repos[0].Release.VPrefix; got {
+		t.Fatalf("vPrefix:false did not survive the round trip: %+v", cfg.Repos[0].Release)
+	}
+	raw := readRawConfig(t, path)
+	release := raw["repos"].(map[string]any)["o/r"].(map[string]any)["release"].(map[string]any)
+	if value, ok := release["vPrefix"]; !ok || value != false {
+		t.Fatalf("raw release vPrefix = %#v", release["vPrefix"])
+	}
+
+	// An omitted key means the default v prefix; the file keeps it implicit.
+	body = `{"config":{"repos":{"o/r":{"release":{"enabled":true}}}}}`
+	if recorder := putConfig(t, web, body, ""); recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+	cfg, err = loadConfig(path)
+	if err != nil {
+		t.Fatalf("saved config does not load: %v", err)
+	}
+	if !cfg.Repos[0].Release.VPrefix {
+		t.Fatalf("an absent vPrefix must load as true: %+v", cfg.Repos[0].Release)
+	}
+	raw = readRawConfig(t, path)
+	release = raw["repos"].(map[string]any)["o/r"].(map[string]any)["release"].(map[string]any)
+	if _, ok := release["vPrefix"]; ok {
+		t.Fatalf("an absent vPrefix must stay absent, got %#v", release)
+	}
+}
+
 func TestWebConfigSavesReleaseArrayForm(t *testing.T) {
 	web, path := newConfigTestWeb(t)
 	body := `{"config":{"repos":[{"repo":"o/r","codingAgent":"codex","release":{"enabled":true,"intervalDays":3}},` +
@@ -171,7 +211,7 @@ func TestWebConfigSavesReleaseArrayForm(t *testing.T) {
 	if len(cfg.Repos) != 2 {
 		t.Fatalf("repos = %+v", cfg.Repos)
 	}
-	want := ReleaseConfig{Enabled: true, IntervalDays: 3, Time: "09:00"}
+	want := ReleaseConfig{Enabled: true, IntervalDays: 3, Time: "09:00", VPrefix: true}
 	if cfg.Repos[0].FullName != "o/r" || cfg.Repos[0].Release != want || cfg.Repos[0].CodingAgent != "codex" {
 		t.Fatalf("first repo = %+v", cfg.Repos[0])
 	}
@@ -192,6 +232,8 @@ func TestWebConfigRejectsInvalidRelease(t *testing.T) {
 		`{"config":{"repos":{"o/r":{"release":{"time":"09:60"}}}}}`,
 		`{"config":{"repos":{"o/r":{"release":{"time":"9"}}}}}`,
 		`{"config":{"repos":{"o/r":{"release":{"time":true}}}}}`,
+		`{"config":{"repos":{"o/r":{"release":{"vPrefix":"yes"}}}}}`,
+		`{"config":{"repos":{"o/r":{"release":{"vPrefix":1}}}}}`,
 		`{"config":{"repos":[{"repo":"o/r","release":{"intervalDays":0}}]}}`,
 		`{"config":{"repos":[{"repo":"o/r","release":{"time":"noon"}}]}}`,
 	}
@@ -208,7 +250,7 @@ func TestWebConfigRejectsInvalidRelease(t *testing.T) {
 
 func TestWebConfigDropsNullReleaseFields(t *testing.T) {
 	web, path := newConfigTestWeb(t)
-	body := `{"config":{"repos":{"o/r":{"release":{"enabled":false,"intervalDays":null,"time":null,"bugBump":null}}}}}`
+	body := `{"config":{"repos":{"o/r":{"release":{"enabled":false,"intervalDays":null,"time":null,"vPrefix":null,"bugBump":null}}}}}`
 	recorder := putConfig(t, web, body, "")
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
@@ -217,6 +259,9 @@ func TestWebConfigDropsNullReleaseFields(t *testing.T) {
 	release := raw["repos"].(map[string]any)["o/r"].(map[string]any)["release"].(map[string]any)
 	if _, ok := release["intervalDays"]; ok {
 		t.Fatalf("intervalDays must be dropped, got %#v", release)
+	}
+	if _, ok := release["vPrefix"]; ok {
+		t.Fatalf("a null vPrefix must be dropped, got %#v", release)
 	}
 	if _, ok := release["time"]; ok {
 		t.Fatalf("a null time must be dropped, got %#v", release)

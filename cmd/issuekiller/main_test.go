@@ -443,11 +443,11 @@ func TestLoadConfigRelease(t *testing.T) {
 		t.Fatalf("repos = %+v", cfg.Repos)
 	}
 	// The object form is sorted by repo name.
-	want := ReleaseConfig{Enabled: true, IntervalDays: 3, Time: "09:00"}
+	want := ReleaseConfig{Enabled: true, IntervalDays: 3, Time: "09:00", VPrefix: true}
 	if cfg.Repos[0].Release != want {
 		t.Fatalf("release = %+v, want %+v", cfg.Repos[0].Release, want)
 	}
-	defaults := ReleaseConfig{Enabled: false, IntervalDays: 1, Time: "09:00"}
+	defaults := ReleaseConfig{Enabled: false, IntervalDays: 1, Time: "09:00", VPrefix: true}
 	if cfg.Repos[1].Release != defaults {
 		t.Fatalf("default release = %+v, want %+v", cfg.Repos[1].Release, defaults)
 	}
@@ -462,7 +462,7 @@ func TestLoadConfigRelease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := cfg.Repos[0].Release; got != (ReleaseConfig{Enabled: true, IntervalDays: 1, Time: "18:30"}) {
+	if got := cfg.Repos[0].Release; got != (ReleaseConfig{Enabled: true, IntervalDays: 1, Time: "18:30", VPrefix: true}) {
 		t.Fatalf("timed release = %+v", got)
 	}
 	if got := cfg.Repos[1].Release; got.Time != "07:05" {
@@ -478,6 +478,23 @@ func TestLoadConfigRelease(t *testing.T) {
 		}
 	}
 
+	// release.vPrefix is optional: absent keeps the historical v1.2.3 form,
+	// false switches this repo to bare 1.2.4 tags.
+	bare := `{"repos":{"me/app":{"release":{"enabled":true,"vPrefix":false}},"me/plain":{}}}`
+	if err := os.WriteFile(path, []byte(bare), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Repos[0].Release.VPrefix {
+		t.Fatalf("vPrefix:false was not kept: %+v", cfg.Repos[0].Release)
+	}
+	if !cfg.Repos[1].Release.VPrefix {
+		t.Fatalf("an absent vPrefix must default to true: %+v", cfg.Repos[1].Release)
+	}
+
 	// bugBump/featureBump were removed when the bump became conventional; an
 	// older config must keep loading instead of failing on the unknown keys.
 	legacy := `{"repos":{"me/app":{"release":{"enabled":true,"bugBump":"major","featureBump":"patch"}}}}`
@@ -488,7 +505,7 @@ func TestLoadConfigRelease(t *testing.T) {
 	if err != nil {
 		t.Fatalf("legacy bump keys must be ignored: %v", err)
 	}
-	if got := cfg.Repos[0].Release; got != (ReleaseConfig{Enabled: true, IntervalDays: 1, Time: "09:00"}) {
+	if got := cfg.Repos[0].Release; got != (ReleaseConfig{Enabled: true, IntervalDays: 1, Time: "09:00", VPrefix: true}) {
 		t.Fatalf("legacy release = %+v", got)
 	}
 }
@@ -513,7 +530,7 @@ func TestLoadConfigRepoObjectArray(t *testing.T) {
 	if cfg.Repos[0].FullName != "me/app" || cfg.Repos[0].CodingAgent != "claude" {
 		t.Fatalf("first repo = %+v", cfg.Repos[0])
 	}
-	want := ReleaseConfig{Enabled: true, IntervalDays: 2, Time: "09:00"}
+	want := ReleaseConfig{Enabled: true, IntervalDays: 2, Time: "09:00", VPrefix: true}
 	if cfg.Repos[0].Release != want {
 		t.Fatalf("release = %+v, want %+v", cfg.Repos[0].Release, want)
 	}

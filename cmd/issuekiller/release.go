@@ -11,7 +11,7 @@ import (
 // Periodic release publishing. A repository opts in with release.enabled; the
 // daemon then checks the default branch at most once per intervalDays, on the
 // configured local time (release.time, 09:00 by default), and publishes a
-// GitHub release when it moved past the newest v* tag, or v0.1.0 when the
+// GitHub release when it moved past the newest version tag, or v0.1.0 when the
 // repository has no version tag yet. Everything here is deliberately small: the
 // tag is the only version source, and the conventional-commit subject decides
 // whether the batch is a feature.
@@ -44,13 +44,26 @@ func versionFromTag(tag string) (releaseVersion, bool) {
 	return releaseVersion{Major: parts[0], Minor: parts[1], Patch: parts[2]}, true
 }
 
+// String renders the version with the default v prefix.
 func (v releaseVersion) String() string {
-	return fmt.Sprintf("v%d.%d.%d", v.Major, v.Minor, v.Patch)
+	return v.Tag(true)
 }
 
-// latestVersionTag returns the highest v* tag. Non-version tags are ignored so
-// a repository's own labels cannot disturb the sequence. A repository without
-// any version tag returns ok=false; checkRelease then publishes initialRelease.
+// Tag renders the release tag with or without the leading v, following
+// release.vPrefix. Existing tags are always parsed with either form, so
+// switching the prefix keeps the numeric sequence intact.
+func (v releaseVersion) Tag(vPrefix bool) string {
+	if vPrefix {
+		return fmt.Sprintf("v%d.%d.%d", v.Major, v.Minor, v.Patch)
+	}
+	return fmt.Sprintf("%d.%d.%d", v.Major, v.Minor, v.Patch)
+}
+
+// latestVersionTag returns the highest version tag, with or without the v
+// prefix. Non-version tags are ignored so a repository's own labels cannot
+// disturb the sequence; a repository that switched release.vPrefix keeps
+// counting from its older v* tags. A repository without any version tag
+// returns ok=false; checkRelease then publishes initialRelease.
 func latestVersionTag(tags []Tag) (releaseVersion, string, bool) {
 	best := ""
 	for _, tag := range tags {
@@ -187,7 +200,7 @@ func commitTitle(commit Commit) string {
 // verbatim so the release follows the repository's own commit language; a
 // release has no issue or PR to detect a scaffolding language from, so the
 // compare footer is the only fixed line and matches GitHub's own format.
-func releaseNotes(fullName, previous string, version releaseVersion, commits []Commit) string {
+func releaseNotes(fullName, previous, tag string, commits []Commit) string {
 	var builder strings.Builder
 	for _, commit := range commits {
 		title := commitTitle(commit)
@@ -201,7 +214,7 @@ func releaseNotes(fullName, previous string, version releaseVersion, commits []C
 		}
 	}
 	if previous != "" {
-		fmt.Fprintf(&builder, "\n**Full Changelog**: https://github.com/%s/compare/%s...%s\n", fullName, previous, version)
+		fmt.Fprintf(&builder, "\n**Full Changelog**: https://github.com/%s/compare/%s...%s\n", fullName, previous, tag)
 	}
 	return strings.TrimRight(builder.String(), "\n")
 }
@@ -260,14 +273,15 @@ func checkRelease(ctx context.Context, app *AppContext) error {
 	if tagged {
 		next = nextReleaseVersion(current, titles)
 	}
-	notes := releaseNotes(app.Repo.FullName, previous, next, commits)
-	if _, err := app.GH.CreateRelease(ctx, app.Repo.FullName, next.String(), next.String(), notes, base); err != nil {
-		return fmt.Errorf("create release %s: %w", next, err)
+	tag := next.Tag(cfg.VPrefix)
+	notes := releaseNotes(app.Repo.FullName, previous, tag, commits)
+	if _, err := app.GH.CreateRelease(ctx, app.Repo.FullName, tag, tag, notes, base); err != nil {
+		return fmt.Errorf("create release %s: %w", tag, err)
 	}
 	app.Store.UpdateMeta(app.Repo.FullName, func(meta *RepoMeta) {
 		meta.LastReleaseCheckAt = nowISO()
 	})
-	app.Log.Info("%s: published release %s (%d commits since %s)", app.Repo.FullName, next, len(commits), firstNonEmpty(previous, "the first commit"))
+	app.Log.Info("%s: published release %s (%d commits since %s)", app.Repo.FullName, tag, len(commits), firstNonEmpty(previous, "the first commit"))
 	return nil
 }
 
