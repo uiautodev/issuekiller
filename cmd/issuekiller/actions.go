@@ -676,6 +676,17 @@ func doReviewPR(ctx context.Context, app *AppContext, trigger Trigger, pr PullRe
 	number := pr.Number
 	app.Log.Info("review start for %s#%d", app.Repo.FullName, number)
 	rememberPRMeta(app, pr)
+	succeeded := false
+	if app.Store != nil {
+		app.Store.SetReviewPhase(app.Repo.FullName, number, "reviewing")
+		// Every return before the success marker is a failed review: keep it on
+		// the board instead of leaving the row stuck in "reviewing".
+		defer func() {
+			if !succeeded {
+				app.Store.SetReviewPhase(app.Repo.FullName, number, "reviewfailed")
+			}
+		}()
+	}
 	react(ctx, app, trigger, "eyes")
 	runDir := runDirForPR(app, number)
 
@@ -765,6 +776,8 @@ func doReviewPR(ctx context.Context, app *AppContext, trigger Trigger, pr PullRe
 	// recorded at enqueue time so the same head is not retried forever, and a
 	// manual `@bot review` remains the way to force a re-run.
 	app.Store.SetReviewedSHA(app.Repo.FullName, number, pr.Head.SHA)
+	app.Store.SetReviewPhase(app.Repo.FullName, number, "reviewed")
+	succeeded = true
 }
 
 // recordReviewedPR remembers the review a 👍 applies and posts the comment that

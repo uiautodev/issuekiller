@@ -55,7 +55,12 @@ type IssueState struct {
 	ReviewCommentID   int64   `json:"reviewCommentId,omitempty"`
 	// ReviewedSHA is the PR head an automatic review already covered, so a
 	// redelivered webhook or the next poll cannot restart it.
-	ReviewedSHA     string        `json:"reviewedSha,omitempty"`
+	ReviewedSHA string `json:"reviewedSha,omitempty"`
+	// ReviewPhase tracks a pull request's review separately from Phase: a
+	// reviewed PR is not an issue task and must keep its empty phase, but the
+	// dashboard still shows "reviewing"/"reviewed"/"reviewfailed" as its own
+	// row.
+	ReviewPhase     string        `json:"reviewPhase,omitempty"`
 	Checks          []CheckResult `json:"checks,omitempty"`
 	Screenshots     []Shot        `json:"screenshots,omitempty"`
 	BlockedReason   string        `json:"blockedReason,omitempty"`
@@ -220,6 +225,24 @@ func (s *Store) SetReviewedSHA(fullName string, number int, sha string) {
 		repo.Issues[key] = issue
 	}
 	issue.ReviewedSHA = sha
+	issue.UpdatedAt = nowISO()
+	_ = s.SaveLocked()
+}
+
+// SetReviewPhase records where a pull request's review stands without touching
+// Phase, so the dashboard can list reviews as tasks while the issue phase
+// machine keeps treating the PR as untracked.
+func (s *Store) SetReviewPhase(fullName string, number int, phase string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	repo := s.repoLocked(fullName)
+	key := itoa(number)
+	issue := repo.Issues[key]
+	if issue == nil {
+		issue = &IssueState{Phase: "", CreatedAt: nowISO()}
+		repo.Issues[key] = issue
+	}
+	issue.ReviewPhase = phase
 	issue.UpdatedAt = nowISO()
 	_ = s.SaveLocked()
 }

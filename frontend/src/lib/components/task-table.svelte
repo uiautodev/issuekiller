@@ -131,7 +131,7 @@
 				</tr>
 			</thead>
 			<tbody>
-				{#each dashboard.tasks as task (task.repo + '#' + task.number)}
+				{#each dashboard.tasks as task (task.repo + '#' + task.number + '#' + task.kind)}
 					<tr
 						class={cn(
 							'cursor-pointer border-b border-border/60 align-middle transition-colors hover:bg-accent/40',
@@ -140,6 +140,7 @@
 						tabindex="0"
 						data-testid="task-row"
 						data-repo={task.repo}
+						data-kind={task.kind}
 						data-number={task.number}
 						onclick={() => dashboard.selectTask(task)}
 						onkeydown={(event) => {

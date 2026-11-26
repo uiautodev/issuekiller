@@ -46,6 +46,95 @@ func TestWebSnapshotOnlyListsTrackedTasks(t *testing.T) {
 	}
 }
 
+func TestWebSnapshotListsPullRequestReviews(t *testing.T) {
+	old := stateDirOverride
+	stateDirOverride = t.TempDir()
+	t.Cleanup(func() { stateDirOverride = old })
+
+	store, err := LoadStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.UpdateIssue("o/r", 1, func(state *IssueState) {
+		state.Phase = "implementing"
+		state.Issue = &IssueMeta{Title: "issue task", URL: "https://example.com/1"}
+	})
+	// A reviewed PR keeps Phase empty: its review is a separate board row.
+	store.SetPRMeta("o/r", 7, &IssueMeta{Title: "review me", URL: "https://example.com/pull/7"})
+	store.SetReviewPhase("o/r", 7, "reviewing")
+	store.SetPRMeta("o/r", 8, &IssueMeta{Title: "already reviewed", URL: "https://example.com/pull/8"})
+	store.SetReviewPhase("o/r", 8, "reviewed")
+
+	if issue := store.Issue("o/r", 7); issue.Phase != "" || issue.ReviewPhase != "reviewing" {
+		t.Fatalf("review state = phase %q review %q, want empty phase and reviewing", issue.Phase, issue.ReviewPhase)
+	}
+
+	cfg := &Config{File: "config.json", PlanParallel: 5, ImplementParallel: 1, Repos: []RepoConfig{{FullName: "o/r", CodingAgent: "opencode"}}}
+	router := NewRouter(&Config{PlanParallel: 1, ImplementParallel: 1}, map[string]*AppContext{"o/r": {}}, "bot", store, NewSilentLogger())
+	web := &webServer{cfg: cfg, router: router, store: store, log: NewSilentLogger()}
+
+	snapshot := web.snapshot()
+	if len(snapshot.Tasks) != 3 {
+		t.Fatalf("tasks = %d, want issue plus two reviews: %+v", len(snapshot.Tasks), snapshot.Tasks)
+	}
+	byNumber := map[int]webTask{}
+	for _, task := range snapshot.Tasks {
+		byNumber[task.Number] = task
+	}
+	review := byNumber[7]
+	if review.Kind != "review" || review.Phase != "reviewing" || review.PhaseLabel != "审查中" {
+		t.Fatalf("review task = %+v", review)
+	}
+	if review.Title != "review me" || review.PRNumber != 7 || review.PRURL != "https://example.com/pull/7" {
+		t.Fatalf("review link = %+v", review)
+	}
+	if done := byNumber[8]; done.Kind != "review" || done.Phase != "reviewed" {
+		t.Fatalf("finished review task = %+v", done)
+	}
+	if issue := byNumber[1]; issue.Kind != "issue" || issue.Phase != "implementing" {
+		t.Fatalf("issue task = %+v", issue)
+	}
+	if len(snapshot.Repos) != 1 || snapshot.Repos[0].Issues != 1 {
+		t.Fatalf("repo issue count = %+v, want only the issue task", snapshot.Repos)
+	}
+	if snapshot.Repos[0].Counts["reviewing"] != 1 || snapshot.Repos[0].Counts["reviewed"] != 1 {
+		t.Fatalf("repo review counts = %+v", snapshot.Repos[0].Counts)
+	}
+}
+
+func TestWebIssueServesPullRequestReview(t *testing.T) {
+	old := stateDirOverride
+	stateDirOverride = t.TempDir()
+	t.Cleanup(func() { stateDirOverride = old })
+
+	store, err := LoadStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.SetReviewPhase("o/r", 7, "reviewing")
+	web := &webServer{cfg: &Config{File: "config.json", WebPort: 8787}, store: store, log: NewSilentLogger()}
+
+	request := httptest.NewRequest(http.MethodGet, "/api/issue?repo=o/r&number=7", nil)
+	recorder := httptest.NewRecorder()
+	web.handleIssue(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want the review task details: %s", recorder.Code, recorder.Body.String())
+	}
+	var state IssueState
+	if err := json.Unmarshal(recorder.Body.Bytes(), &state); err != nil {
+		t.Fatal(err)
+	}
+	if state.Phase != "" || state.ReviewPhase != "reviewing" {
+		t.Fatalf("state = %+v", state)
+	}
+
+	missing := httptest.NewRecorder()
+	web.handleIssue(missing, httptest.NewRequest(http.MethodGet, "/api/issue?repo=o/r&number=8", nil))
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("unknown task status = %d, want 404", missing.Code)
+	}
+}
+
 func TestWebSnapshotCountsTasksWaitingForUser(t *testing.T) {
 	old := stateDirOverride
 	stateDirOverride = t.TempDir()

@@ -206,7 +206,9 @@ A new pull request in a watched repo is reviewed **automatically** (on by
 default): every new head gets the same review with inline findings, while
 drafts and the bot's own PRs are left alone. A repo that only wants the manual
 command sets `"autoReview": false`; a failed review is retried by a new push or
-`@agent review`, not by the poller.
+`@agent review`, not by the poller. Reviews appear on the dashboard as their own
+tasks (reviewing / reviewed / failed) with the PR title and link, next to the
+issue tasks; finished reviews follow the hide-finished toggle.
 
 Every accepted 👍 gets an 👀 reaction immediately, so you can see the daemon
 picked it up while the work is still running.

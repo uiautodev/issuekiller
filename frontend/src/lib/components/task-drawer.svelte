@@ -12,10 +12,12 @@
 	let task = $derived(dashboard.selectedTask);
 	let issue = $derived(dashboard.issue);
 	let canApprove = $derived(
-		issue?.phase === 'awaiting_approval' || issue?.phase === 'blocked'
+		task?.kind !== 'review' &&
+			(issue?.phase === 'awaiting_approval' || issue?.phase === 'blocked')
 	);
 	let canCancel = $derived(
 		!!issue &&
+			task?.kind !== 'review' &&
 			['new', 'planning', 'awaiting_approval', 'blocked', 'implementing', 'pr_open'].includes(
 				issue.phase
 			)
@@ -47,7 +49,7 @@
 						id="drawer-title"
 						class="font-sans text-xl leading-tight font-semibold break-words"
 					>
-						{task.title || 'issue #' + task.number}
+						{task.title || (task.kind === 'review' ? 'PR #' : 'issue #') + task.number}
 					</h2>
 					<div class="mt-1 text-xs break-words text-muted-foreground">
 						{task.repo} #{task.number}
@@ -77,7 +79,7 @@
 
 				{#if issue}
 					<div class="flex flex-wrap gap-4 text-sm">
-						{#if task.url}
+						{#if task.url && task.kind !== 'review'}
 							<a
 								href={task.url}
 								target="_blank"
@@ -119,7 +121,7 @@
 					<h3 class="band-title mt-6 mb-2">{t('drawer.status')}</h3>
 					<dl class="grid grid-cols-[7rem_1fr] gap-x-3 gap-y-1.5 text-sm">
 						<dt class="text-muted-foreground">{t('drawer.phase')}</dt>
-						<dd class="break-words">{dashboard.phaseLabel(issue.phase)}</dd>
+						<dd class="break-words">{dashboard.phaseLabel(task.phase)}</dd>
 						<dt class="text-muted-foreground">{t('drawer.started')}</dt>
 						<dd class="break-words">{fmtTime(issue.startedAt, i18n.lang)}</dd>
 						<dt class="text-muted-foreground">{t('drawer.updated')}</dt>

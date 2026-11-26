@@ -69,3 +69,30 @@ func TestSetReviewedSHARoundTrip(t *testing.T) {
 		t.Fatalf("a pull request tracked for review has phase %q, want none", issue.Phase)
 	}
 }
+
+func TestSetReviewPhaseRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	oldStateDir := stateDirOverride
+	stateDirOverride = dir
+	t.Cleanup(func() { stateDirOverride = oldStateDir })
+	if err := ensureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := LoadStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.SetReviewPhase("me/app", 12, "reviewing")
+
+	reloaded, err := LoadStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	issue := reloaded.Issue("me/app", 12)
+	if issue.ReviewPhase != "reviewing" {
+		t.Fatalf("ReviewPhase = %q, want reviewing", issue.ReviewPhase)
+	}
+	if issue.Phase != "" {
+		t.Fatalf("a reviewed pull request has phase %q, want none", issue.Phase)
+	}
+}

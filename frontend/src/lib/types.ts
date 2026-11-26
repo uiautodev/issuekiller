@@ -23,6 +23,7 @@ export interface RepoInfo {
 
 export interface Task {
 	repo: string;
+	kind: 'issue' | 'review';
 	number: number;
 	title: string;
 	url: string;

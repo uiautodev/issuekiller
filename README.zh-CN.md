@@ -171,7 +171,9 @@ go build -o bin/issuekiller ./cmd/issuekiller
 被 watch 的仓库收到新 PR 会**自动 review**（默认开启）：每个新 head 都会收到
 同样的 review（总结 + 行内意见），draft 和 bot 自己提的 PR 除外；只想手动 review
 的仓库把 `"autoReview": false` 写进该仓库的配置。某个 head 的 review 失败后不会由
-轮询自动重试，新的 push 或 `@agent review` 才会再跑一次。
+轮询自动重试，新的 push 或 `@agent review` 才会再跑一次。review 会作为独立任务
+显示在看板上（审查中 / 已审查 / 审查失败），带 PR 标题和链接，与 issue 任务并列；
+已结束的 review 跟随「隐藏已结束」开关。
 
 每个被接受的 👍 都会立刻收到一个 👀 回应，任务还在排队或执行时也能看到已经收到。
 

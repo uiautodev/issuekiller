@@ -540,6 +540,10 @@ func (r *Router) enqueueAutoReview(ctx context.Context, app *AppContext, pr Pull
 	// retried on every poll, and a second delivery of the same event is a
 	// no-op. doReviewPR overwrites it with the head it actually reviewed.
 	r.store.SetReviewedSHA(app.Repo.FullName, pr.Number, pr.Head.SHA)
+	// The review is its own dashboard task: remember the PR title and mark the
+	// row immediately, so a queued review is visible before the agent starts.
+	rememberPRMeta(app, pr)
+	r.store.SetReviewPhase(app.Repo.FullName, pr.Number, "reviewing")
 	r.log.Info("auto review queued for %s#%d (head %s)", app.Repo.FullName, pr.Number, shortSHA(pr.Head.SHA))
 	key := fmt.Sprintf("%s#%d#review", app.Repo.FullName, pr.Number)
 	r.enqueue(app.Repo.FullName, key, stagePlan, func(jobCtx context.Context) {
@@ -548,9 +552,13 @@ func (r *Router) enqueueAutoReview(ctx context.Context, app *AppContext, pr Pull
 		fresh, err := app.GH.GetPR(jobCtx, app.Repo.FullName, pr.Number)
 		if err != nil {
 			app.Log.Warn("auto review %s#%d: %v", app.Repo.FullName, pr.Number, err)
+			r.store.SetReviewPhase(app.Repo.FullName, pr.Number, "reviewfailed")
 			return
 		}
 		if fresh.State != "open" || fresh.Draft {
+			// There is nothing to review after all; drop the synthetic task
+			// instead of leaving it "reviewing" forever.
+			r.store.SetReviewPhase(app.Repo.FullName, pr.Number, "")
 			return
 		}
 		doReviewPR(jobCtx, app, Trigger{
@@ -1190,23 +1198,33 @@ func (r *Router) HandleTrigger(ctx context.Context, fullName string, trigger Tri
 
 		if command == "review" && isApprover {
 			reviewKey := fmt.Sprintf("%s#%d#review", fullName, trigger.IssueNumber)
+			r.store.SetReviewPhase(fullName, trigger.IssueNumber, "reviewing")
 			r.enqueue(fullName, reviewKey, stagePlan, func(jobCtx context.Context) {
+				// Nothing before doReviewPR is a review result: clear the row
+				// when the target turns out not to be reviewable.
+				clearReview := func(phase string) {
+					r.store.SetReviewPhase(fullName, trigger.IssueNumber, phase)
+				}
 				issue, err := app.GH.GetIssue(jobCtx, fullName, trigger.IssueNumber)
 				if err != nil {
 					app.Log.Warn("review %s#%d: %v", fullName, trigger.IssueNumber, err)
+					clearReview("reviewfailed")
 					return
 				}
 				if issue.State != "open" {
+					clearReview("")
 					return
 				}
 				if issue.PullRequest == nil {
 					_, _ = app.GH.PostComment(jobCtx, fullName, trigger.IssueNumber,
 						fmt.Sprintf(app.text(trigger.IssueNumber, "router.review_not_pr"), r.agentLogin))
+					clearReview("")
 					return
 				}
 				pr, err := app.GH.GetPR(jobCtx, fullName, trigger.IssueNumber)
 				if err != nil {
 					app.Log.Warn("review %s#%d: get PR: %v", fullName, trigger.IssueNumber, err)
+					clearReview("reviewfailed")
 					return
 				}
 				doReviewPR(jobCtx, app, trigger, pr)

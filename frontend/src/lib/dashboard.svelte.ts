@@ -5,7 +5,7 @@ import {
 	postAction
 } from './api';
 import { t } from './i18n.svelte';
-import { needsMe, phaseMeta } from './phases';
+import { isFinished, needsMe, phaseMeta } from './phases';
 import { needsConfirmation } from './utils';
 import type { IssueState, Snapshot, Task } from './types';
 
@@ -66,9 +66,7 @@ class DashboardStore {
 
 	counts = $derived.by(() => {
 		const tasks = this.data?.tasks || [];
-		const finished = tasks.filter(
-			(task) => task.phase === 'done' || task.phase === 'cancelled'
-		).length;
+		const finished = tasks.filter((task) => isFinished(task.phase)).length;
 		return {
 			all: this.hideFinished ? tasks.length - finished : tasks.length,
 			active: tasks.filter((task) => task.active || task.queued).length,
@@ -115,7 +113,7 @@ class DashboardStore {
 
 	matches(task: Task): boolean {
 		if (this.repo && task.repo !== this.repo) return false;
-		if (this.hideFinished && (task.phase === 'done' || task.phase === 'cancelled')) return false;
+		if (this.hideFinished && isFinished(task.phase)) return false;
 		if (this.filter === 'active' && !(task.active || task.queued)) return false;
 		if (this.filter === 'wait' && !needsMe(task.phase)) return false;
 		if (this.filter === 'blocked' && task.phase !== 'blocked') return false;

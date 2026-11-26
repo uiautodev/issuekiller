@@ -23,9 +23,21 @@ export const PHASES: Record<string, PhaseMeta> = {
 	pr_open: { key: 'phase.prOpen', cls: 'waiting', step: 5 },
 	merging: { key: 'phase.merging', cls: 'working', step: 6 },
 	done: { key: 'phase.done', cls: 'done', step: 6 },
-	cancelled: { key: 'phase.cancelled', cls: 'idle', step: 0 }
+	cancelled: { key: 'phase.cancelled', cls: 'idle', step: 0 },
+	// Pull-request reviews reuse the board but not the issue phase machine.
+	// The rail has no review stage, so a running review sits at the PR/checks
+	// step and a finished one fills it.
+	reviewing: { key: 'phase.reviewing', cls: 'working', step: 5 },
+	reviewed: { key: 'phase.reviewed', cls: 'done', step: 6 },
+	reviewfailed: { key: 'phase.reviewFailed', cls: 'blocked', step: 5 }
 };
 
 export function phaseMeta(phase: string): PhaseMeta {
 	return PHASES[phase] || PHASES.new;
+}
+
+// Finished rows include successful and failed reviews: both are history, not
+// work the board must keep in front of the user.
+export function isFinished(phase: string): boolean {
+	return ['done', 'cancelled', 'reviewed', 'reviewfailed'].includes(phase);
 }

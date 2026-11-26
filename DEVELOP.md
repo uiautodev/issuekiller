@@ -190,7 +190,10 @@ dependencies.
 comment, also a 👍 target), `Checks`, `Screenshots`, `BlockedReason`,
 `ProcessedComments`/`ProcessedFeedback`, `MergedAt`/`CancelledAt`,
 `ReviewedSHA` (the PR head an automatic review already covered; a pull
-request tracked only for review keeps phase empty — it is not a task).
+request tracked only for review keeps phase empty — it is not an issue) and
+`ReviewPhase` (`reviewing`/`reviewed`/`reviewfailed`). `ReviewPhase` is a
+separate axis: the board shows it as a review task while `Phase` stays empty,
+and it never enters the issue phase machine.
 
 | phase | meaning | who sets it |
 | --- | --- | --- |
@@ -257,7 +260,10 @@ Other rules:
   the poller: they still arrive through `issue_comment` events, so a PR costs
   one `GET /pulls/{n}` per poll at most (only while it changes). The first
   poll of a repository without a stored `LastPollAt` has no `since` window and
-  therefore reviews the current head of every open PR once.
+  therefore reviews the current head of every open PR once. The review is a
+  board task of its own: enqueue and the manual command set `ReviewPhase` to
+  `reviewing`, success moves it to `reviewed`, a failed run to `reviewfailed`,
+  and the dashboard keeps the PR title and link from `SetPRMeta`.
 - A non-command mention from an approver on a pull request the daemon does not
   own is a **modification request** (`doModifyPR`): edit the PR head, run the
   checks and push back to the head branch. Same-repository branches are pushed
@@ -621,7 +627,10 @@ helper (`open`/`xdg-open`/`rundll32`) without a shell. Queue depth in
 `/api/state` includes `plan`, `work` and `ci`. `waiting` counts tasks whose phase
 needs the approver (`awaiting_approval`, `pr_open`, `blocked`, see
 `phaseNeedsUser`); the board can be filtered by phase, by project (the repo
-dropdown) and by free text.
+dropdown) and by free text. Tasks have a `kind`: issue rows come from `Phase`,
+review rows from `ReviewPhase` (`reviewing`, `reviewed`, `reviewfailed`) and
+carry the PR title/link. Finished rows include `done`, `cancelled`, `reviewed`
+and `reviewfailed`, so the hide-finished toggle also clears review history.
 
 The page is a client-rendered SvelteKit SPA in `frontend/` (Svelte 5 runes,
 Tailwind v4, shadcn-svelte CSS tokens). `npm run build` writes it to
@@ -813,8 +822,8 @@ keeps tests quiet. Notable coverage:
 | `shots_test.go` | before/after composition and screenshot markdown |
 | `plan_test.go` | plan text trimming |
 | `watch_test.go` | config reload fires on valid edits, ignores invalid ones |
-| `watcher_test.go` | `Store` round-trip, `ReviewedSHA` persistence for auto-review dedup |
-| `web_test.go` | dashboard snapshot only lists tracked tasks, `/api/open-url` validation and browser handoff, embedded SPA serving (index, hashed assets, cache headers, 404s, SPA fallback, unbuilt-frontend hint) |
+| `watcher_test.go` | `Store` round-trip, `ReviewedSHA` persistence for auto-review dedup, `ReviewPhase` persistence with an empty issue phase |
+| `web_test.go` | dashboard snapshot only lists tracked tasks and lists review-only PRs as `kind: review` rows with their `ReviewPhase`, `/api/issue` serves those review rows, `/api/open-url` validation and browser handoff, embedded SPA serving (index, hashed assets, cache headers, 404s, SPA fallback, unbuilt-frontend hint) |
 | `oauth_test.go` | Device Flow pending/slow_down/expired, token file 0600, refresh success/failure, credential precedence, 401 retry, login/paste endpoints, login panel markup |
 | `openurl_test.go` | per-platform browser command, no shell, injected runner |
 | `webconfig_test.go` | `/api/config` validation/round-trip/origin check, `release` defaults and rejection, `/api/detect` degradation, `/api/update` payload, snapshot without a router |

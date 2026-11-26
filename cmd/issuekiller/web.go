@@ -107,7 +107,10 @@ type webRepo struct {
 }
 
 type webTask struct {
-	Repo        string `json:"repo"`
+	Repo string `json:"repo"`
+	// Kind is "issue" for the issue flow and "review" for a pull-request
+	// review, which is shown on the board without entering the issue phases.
+	Kind        string `json:"kind"`
 	Number      int    `json:"number"`
 	Title       string `json:"title"`
 	URL         string `json:"url"`
@@ -445,7 +448,7 @@ func (w *webServer) handleIssue(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 	state := w.store.Issue(repo, number)
-	if state.Phase == "" {
+	if state.Phase == "" && state.ReviewPhase == "" {
 		http.Error(rw, "unknown issue", http.StatusNotFound)
 		return
 	}
@@ -530,12 +533,55 @@ func (w *webServer) snapshot() webSnapshot {
 
 	for _, item := range issued {
 		state := item.State
-		// Issues without a phase are only comment watermarks (the poller now
-		// records them for untracked issues too); they are not tasks.
+		key := fmt.Sprintf("%s#%d", item.Repo, item.Number)
+		reviewKey := key + "#review"
+		reviewActive, reviewQueued := routerState.Active[reviewKey], routerState.Queued[reviewKey]
 		if state.Phase == "" {
+			// A pull request tracked only for review keeps phase empty. Its
+			// ReviewPhase (or a live #review job) still makes it a task the
+			// dashboard must show; anything else without a phase is only a
+			// comment watermark and must stay hidden.
+			if state.ReviewPhase == "" && !reviewActive && !reviewQueued {
+				continue
+			}
+			reviewPhase := firstNonEmpty(state.ReviewPhase, "reviewing")
+			task := webTask{
+				Repo:       item.Repo,
+				Kind:       "review",
+				Number:     item.Number,
+				Phase:      reviewPhase,
+				PhaseLabel: phaseLabel(reviewPhase),
+				Active:     reviewActive,
+				Queued:     reviewQueued,
+				// SetReviewPhase stamps UpdatedAt when the review is queued and
+				// when it finishes; it is the review's only clock.
+				StartedAt: state.UpdatedAt,
+				UpdatedAt: state.UpdatedAt,
+				PRNumber:  item.Number,
+			}
+			if state.Issue != nil {
+				task.Title = state.Issue.Title
+				task.URL = state.Issue.URL
+				task.PRURL = state.Issue.URL
+			}
+			if task.Title == "" {
+				task.Title = fmt.Sprintf("PR #%d", item.Number)
+			}
+			if task.URL == "" {
+				task.URL = fmt.Sprintf("https://github.com/%s/pull/%d", item.Repo, item.Number)
+				task.PRURL = task.URL
+			}
+			if task.Active && task.StartedAt != "" {
+				task.ElapsedSec = secondsSince(task.StartedAt, now)
+			} else if task.UpdatedAt != "" {
+				task.ElapsedSec = secondsSince(task.UpdatedAt, now)
+			}
+			if entry, ok := repoEntries[item.Repo]; ok {
+				entry.Counts[reviewPhase]++
+			}
+			snapshot.Tasks = append(snapshot.Tasks, task)
 			continue
 		}
-		key := fmt.Sprintf("%s#%d", item.Repo, item.Number)
 		active, queued := routerState.Active[key], routerState.Queued[key]
 		// Old watermarks were stored with phase "new" by UpdateIssue; hide
 		// those unless there is real work behind them.
@@ -545,6 +591,7 @@ func (w *webServer) snapshot() webSnapshot {
 		phase := firstNonEmpty(state.Phase, "new")
 		task := webTask{
 			Repo:        item.Repo,
+			Kind:        "issue",
 			Number:      item.Number,
 			Phase:       state.Phase,
 			PhaseLabel:  phaseLabel(phase),
@@ -619,7 +666,8 @@ func sortTasks(tasks []webTask) {
 			return 3
 		case task.Phase == "pr_open":
 			return 4
-		case task.Phase == "done" || task.Phase == "cancelled":
+		case task.Phase == "done" || task.Phase == "cancelled" ||
+			task.Phase == "reviewed" || task.Phase == "reviewfailed":
 			return 9
 		default:
 			return 5
@@ -654,6 +702,12 @@ func phaseLabel(phase string) string {
 		return "已完成"
 	case "cancelled":
 		return "已取消"
+	case "reviewing":
+		return "审查中"
+	case "reviewed":
+		return "已审查"
+	case "reviewfailed":
+		return "审查失败"
 	}
 	return phase
 }
