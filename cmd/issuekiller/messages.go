@@ -16,6 +16,8 @@ var scaffoldZH = map[string]string{
 	"plan.truncated": "…(截断)",
 
 	"common.screenshots": "## 截图",
+	"common.shot_before": "%s（改动前）",
+	"common.shot_after":  "%s（改动后）",
 	"common.ui_note":     "## UI 验证",
 	"common.no_ui":       "未涉及 UI 改动，无截图。",
 	"common.ui_missing":  "⚠️ 本次改动涉及 UI，但没有产出 before/after 截图。",
@@ -108,6 +110,8 @@ var scaffoldEN = map[string]string{
 	"plan.truncated": "…(truncated)",
 
 	"common.screenshots": "## Screenshots",
+	"common.shot_before": "%s (before)",
+	"common.shot_after":  "%s (after)",
 	"common.ui_note":     "## UI verification",
 	"common.no_ui":       "No UI change, no screenshots.",
 	"common.ui_missing":  "⚠️ This change touches the UI but produced no before/after screenshots.",

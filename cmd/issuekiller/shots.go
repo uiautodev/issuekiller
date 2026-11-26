@@ -4,12 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"image"
-	"image/color"
-	"image/draw"
-	_ "image/gif"
-	_ "image/jpeg"
-	"image/png"
 	"os"
 	"path/filepath"
 	"strings"
@@ -66,69 +60,6 @@ func resolveRunFile(runDir, value string) string {
 	return file
 }
 
-// composeBeforeAfter stacks before above after on a white canvas, separated
-// by a light gutter with a dark divider so it is obvious which half is the old
-// version. Stacking keeps each screenshot at full width, which matters on a
-// phone where a side-by-side pair is unreadably small. Pure stdlib image code.
-func composeBeforeAfter(beforeFile, afterFile, outFile string) error {
-	before, err := decodeImage(beforeFile)
-	if err != nil {
-		return fmt.Errorf("decode before: %w", err)
-	}
-	after, err := decodeImage(afterFile)
-	if err != nil {
-		return fmt.Errorf("decode after: %w", err)
-	}
-
-	beforeBounds := before.Bounds()
-	afterBounds := after.Bounds()
-	beforeWidth, beforeHeight := beforeBounds.Dx(), beforeBounds.Dy()
-	afterWidth, afterHeight := afterBounds.Dx(), afterBounds.Dy()
-	width := beforeWidth
-	if afterWidth > width {
-		width = afterWidth
-	}
-	const (
-		gap     = 20
-		divider = 2
-	)
-	height := beforeHeight + gap + afterHeight
-
-	canvas := image.NewRGBA(image.Rect(0, 0, width, height))
-	draw.Draw(canvas, canvas.Bounds(), &image.Uniform{C: color.White}, image.Point{}, draw.Src)
-
-	gutter := image.Rect(0, beforeHeight, width, beforeHeight+gap)
-	draw.Draw(canvas, gutter, &image.Uniform{C: color.RGBA{R: 0xe2, G: 0xe8, B: 0xf0, A: 0xff}}, image.Point{}, draw.Src)
-	lineY := beforeHeight + (gap-divider)/2
-	draw.Draw(canvas, image.Rect(0, lineY, width, lineY+divider), &image.Uniform{C: color.RGBA{R: 0x47, G: 0x55, B: 0x69, A: 0xff}}, image.Point{}, draw.Src)
-
-	beforeLeft := (width - beforeWidth) / 2
-	afterLeft := (width - afterWidth) / 2
-	afterTop := beforeHeight + gap
-	draw.Draw(canvas, image.Rect(beforeLeft, 0, beforeLeft+beforeWidth, beforeHeight), before, beforeBounds.Min, draw.Over)
-	draw.Draw(canvas, image.Rect(afterLeft, afterTop, afterLeft+afterWidth, afterTop+afterHeight), after, afterBounds.Min, draw.Over)
-
-	if err := os.MkdirAll(filepath.Dir(outFile), 0o755); err != nil {
-		return err
-	}
-	handle, err := os.Create(outFile)
-	if err != nil {
-		return err
-	}
-	defer handle.Close()
-	return png.Encode(handle, canvas)
-}
-
-func decodeImage(file string) (image.Image, error) {
-	handle, err := os.Open(file)
-	if err != nil {
-		return nil, err
-	}
-	defer handle.Close()
-	img, _, err := image.Decode(handle)
-	return img, err
-}
-
 func parseShotEntry(raw json.RawMessage) (ShotEntry, error) {
 	var path string
 	if err := json.Unmarshal(raw, &path); err == nil {
@@ -141,11 +72,21 @@ func parseShotEntry(raw json.RawMessage) (ShotEntry, error) {
 	return entry, nil
 }
 
-func collectScreenshots(ctx context.Context, gh *GH, runDir string, manifest ResultManifest, repoID int64, log *Logger) []Shot {
+// collectScreenshots uploads the images named in the manifest. A before/after
+// pair stays two images: GitHub scales one tall composite down until the text
+// in it is unreadable, so both are uploaded and separated by a rule in the
+// comment. app is needed for the locale of the before/after captions.
+func collectScreenshots(ctx context.Context, app *AppContext, number int, runDir string, manifest ResultManifest) []Shot {
 	if len(manifest.Screenshots) == 0 {
 		return nil
 	}
+	log := app.Log
 	shots := make([]Shot, 0, len(manifest.Screenshots))
+	appendShot := func(file, caption string) {
+		if shot, ok := uploadShot(ctx, app, file, caption); ok {
+			shots = append(shots, shot)
+		}
+	}
 	for index, raw := range manifest.Screenshots {
 		entry, err := parseShotEntry(raw)
 		if err != nil {
@@ -157,10 +98,9 @@ func collectScreenshots(ctx context.Context, gh *GH, runDir string, manifest Res
 			caption = fmt.Sprintf("UI change %d", index+1)
 		}
 
-		file := ""
 		switch {
 		case entry.Combined != "":
-			file = resolveRunFile(runDir, entry.Combined)
+			appendShot(resolveRunFile(runDir, entry.Combined), caption)
 		case entry.Before != "" && entry.After != "":
 			before := resolveRunFile(runDir, entry.Before)
 			after := resolveRunFile(runDir, entry.After)
@@ -168,34 +108,38 @@ func collectScreenshots(ctx context.Context, gh *GH, runDir string, manifest Res
 				log.Warn("screenshot pair %q missing before/after file", caption)
 				continue
 			}
-			file = filepath.Join(runDir, "screenshots", fmt.Sprintf("combined-%02d.png", index+1))
-			if err := composeBeforeAfter(before, after, file); err != nil {
-				log.Warn("compose %q: %v", caption, err)
-				continue
-			}
-			log.Info("composed before/after: %s", file)
+			appendShot(before, fmt.Sprintf(app.text(number, "common.shot_before"), caption))
+			appendShot(after, fmt.Sprintf(app.text(number, "common.shot_after"), caption))
 		case entry.After != "":
-			file = resolveRunFile(runDir, entry.After)
 			log.Warn("screenshot %q has no before image, uploading after only", caption)
-		}
-
-		if file == "" {
+			appendShot(resolveRunFile(runDir, entry.After), caption)
+		default:
 			log.Warn("screenshot %q not found", caption)
-			continue
 		}
-		info, err := os.Stat(file)
-		if err != nil || info.Size() == 0 {
-			continue
-		}
-		url, err := gh.UploadAttachment(ctx, repoID, file)
-		if err != nil {
-			log.Warn("upload screenshot %s: %v", filepath.Base(file), err)
-			continue
-		}
-		shots = append(shots, Shot{Name: filepath.Base(file), Caption: caption, URL: url, Size: info.Size()})
-		log.Info("screenshot uploaded: %s -> %s", filepath.Base(file), url)
 	}
 	return shots
+}
+
+// uploadShot uploads one image and reports whether it became a Shot. A missing
+// or empty file is warned about and dropped so one bad entry cannot cost the
+// whole results section.
+func uploadShot(ctx context.Context, app *AppContext, file, caption string) (Shot, bool) {
+	if file == "" {
+		app.Log.Warn("screenshot %q not found", caption)
+		return Shot{}, false
+	}
+	info, err := os.Stat(file)
+	if err != nil || info.Size() == 0 {
+		app.Log.Warn("screenshot %q is unreadable or empty", caption)
+		return Shot{}, false
+	}
+	url, err := app.GH.UploadAttachment(ctx, app.RepoInfo.ID, file)
+	if err != nil {
+		app.Log.Warn("upload screenshot %s: %v", filepath.Base(file), err)
+		return Shot{}, false
+	}
+	app.Log.Info("screenshot uploaded: %s -> %s", filepath.Base(file), url)
+	return Shot{Name: filepath.Base(file), Caption: caption, URL: url, Size: info.Size()}, true
 }
 
 func screenshotsMarkdown(shots []Shot) string {
@@ -204,7 +148,7 @@ func screenshotsMarkdown(shots []Shot) string {
 	}
 	parts := make([]string, 0, len(shots))
 	for _, shot := range shots {
-		parts = append(parts, fmt.Sprintf("**%s**（上：改动前 / 下：改动后）\n\n![%s](%s)", shot.Caption, shot.Caption, shot.URL))
+		parts = append(parts, fmt.Sprintf("**%s**\n\n![%s](%s)", shot.Caption, shot.Caption, shot.URL))
 	}
-	return strings.Join(parts, "\n\n")
+	return strings.Join(parts, "\n\n---\n\n")
 }

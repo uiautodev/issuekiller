@@ -64,6 +64,6 @@ Only include checks you actually ran and that pass.
 Write `summary`, `changes` and `tests` in {{LANGUAGE}}; keep code, identifiers and
 file paths unchanged.
 
-Screenshots — only for user-visible UI changes, tightly cropped to the changed region with whatever capture the available automation offers, before/after with the same viewport and theme; include the other theme when colors are involved. Skip them for backend/docs/test changes and set `"uiChanged": false`.
+Screenshots — only for user-visible UI changes, tightly cropped to the changed region with whatever capture the available automation offers, before/after with the same viewport and theme; include the other theme when colors are involved. Do not compose them yourself: the harness uploads the two images separately. Skip them for backend/docs/test changes and set `"uiChanged": false`.
 
 Reply with a short summary when done. The harness runs checks.json and pushes to the existing branch.

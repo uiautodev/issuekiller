@@ -1,96 +1,134 @@
 package main
 
 import (
-	"image"
-	"image/color"
-	"image/png"
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
-func writeSolid(t *testing.T, file string, width, height int, c color.Color) {
+// newUploadApp serves GitHub's user-attachments endpoint with one distinct URL
+// per upload and returns an app aimed at it.
+func newUploadApp(t *testing.T, language string) (*AppContext, *int) {
 	t.Helper()
-	img := image.NewRGBA(image.Rect(0, 0, width, height))
-	for y := 0; y < height; y++ {
-		for x := 0; x < width; x++ {
-			img.Set(x, y, c)
-		}
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		_, _ = fmt.Fprintf(w, `{"url":"https://example.com/upload-%d.png"}`, calls)
+	}))
+	t.Cleanup(server.Close)
+	gh := &GH{Token: "token", UploadBase: server.URL, Upload: server.Client()}
+	app := &AppContext{
+		Cfg:      &Config{Language: language},
+		RepoInfo: RepoInfo{ID: 42},
+		GH:       gh,
+		Log:      NewSilentLogger(),
 	}
-	handle, err := os.Create(file)
-	if err != nil {
+	return app, &calls
+}
+
+func writeFile(t *testing.T, file string, data string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	defer handle.Close()
-	if err := png.Encode(handle, img); err != nil {
+	if err := os.WriteFile(file, []byte(data), 0o644); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func TestComposeBeforeAfter(t *testing.T) {
+func TestCollectScreenshotsUploadsBeforeAndAfterSeparately(t *testing.T) {
 	dir := t.TempDir()
-	before := filepath.Join(dir, "before.png")
-	after := filepath.Join(dir, "after.png")
-	out := filepath.Join(dir, "combined.png")
-	writeSolid(t, before, 100, 50, color.RGBA{R: 255, A: 255})
-	writeSolid(t, after, 80, 70, color.RGBA{B: 255, A: 255})
+	writeFile(t, filepath.Join(dir, "screenshots", "before-top.png"), "before")
+	writeFile(t, filepath.Join(dir, "screenshots", "after-top.png"), "after")
 
-	if err := composeBeforeAfter(before, after, out); err != nil {
-		t.Fatal(err)
+	app, calls := newUploadApp(t, "zh")
+	manifest := ResultManifest{Screenshots: []json.RawMessage{
+		json.RawMessage(`{"caption":"顶部工具栏","before":"screenshots/before-top.png","after":"screenshots/after-top.png"}`),
+	}}
+	shots := collectScreenshots(context.Background(), app, 7, dir, manifest)
+
+	if *calls != 2 {
+		t.Fatalf("uploads = %d, want 2 (one per image)", *calls)
 	}
-	handle, err := os.Open(out)
-	if err != nil {
-		t.Fatal(err)
+	if len(shots) != 2 {
+		t.Fatalf("shots = %d, want 2", len(shots))
 	}
-	defer handle.Close()
-	img, _, err := image.Decode(handle)
-	if err != nil {
-		t.Fatal(err)
+	if shots[0].URL == shots[1].URL {
+		t.Fatalf("both shots share URL %q, want separate uploads", shots[0].URL)
 	}
-	// Full width of the wider image, stacked: 50 + 20px gap + 70.
-	if img.Bounds().Dx() != 100 || img.Bounds().Dy() != 140 {
-		t.Fatalf("combined size = %dx%d, want 100x140", img.Bounds().Dx(), img.Bounds().Dy())
+	if !strings.Contains(shots[0].Caption, "顶部工具栏") || !strings.Contains(shots[0].Caption, "改动前") {
+		t.Fatalf("first caption = %q, want the caption plus 改动前", shots[0].Caption)
 	}
-	// Before on top, after below the gutter.
-	if r, _, _, _ := img.At(10, 10).RGBA(); r>>8 < 0xf0 {
-		t.Fatalf("before image should be at the top, got %#x", r>>8)
+	if !strings.Contains(shots[1].Caption, "顶部工具栏") || !strings.Contains(shots[1].Caption, "改动后") {
+		t.Fatalf("second caption = %q, want the caption plus 改动后", shots[1].Caption)
 	}
-	if _, _, b, _ := img.At(10, 80).RGBA(); b>>8 < 0xf0 {
-		t.Fatalf("after image should be below the gutter, got %#x", b>>8)
-	}
-	// The gutter is light grey and carries a dark divider across it.
-	if r, _, _, _ := img.At(50, 52).RGBA(); r>>8 < 0xd0 {
-		t.Fatalf("gutter should be light grey, got %#x", r>>8)
-	}
-	if r, g, b, _ := img.At(50, 59).RGBA(); r>>8 > 0x80 || g>>8 > 0x80 || b>>8 > 0x80 {
-		t.Fatalf("divider should be dark, got %#x %#x %#x", r>>8, g>>8, b>>8)
+	if shots[0].Name != "before-top.png" || shots[1].Name != "after-top.png" {
+		t.Fatalf("names = %q, %q, want the original files", shots[0].Name, shots[1].Name)
 	}
 }
 
-func TestScreenshotsMarkdown(t *testing.T) {
-	md := screenshotsMarkdown([]Shot{{Caption: "顶部工具栏", URL: "https://example.com/a.png"}})
-	if md == "" {
-		t.Fatal("expected markdown")
+func TestCollectScreenshotsEnglishCaptionsAndSingleImage(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "before.png"), "before")
+	writeFile(t, filepath.Join(dir, "after.png"), "after")
+	writeFile(t, filepath.Join(dir, "combined.png"), "combined")
+
+	app, _ := newUploadApp(t, "en")
+	manifest := ResultManifest{Screenshots: []json.RawMessage{
+		json.RawMessage(`{"caption":"Header","before":"before.png","after":"after.png"}`),
+		json.RawMessage(`{"caption":"Dialog","combined":"combined.png"}`),
+	}}
+	shots := collectScreenshots(context.Background(), app, 7, dir, manifest)
+
+	if len(shots) != 3 {
+		t.Fatalf("shots = %d, want 3 (pair plus combined)", len(shots))
 	}
-	for _, want := range []string{"顶部工具栏", "上：改动前", "https://example.com/a.png"} {
-		if !contains(md, want) {
+	if shots[0].Caption != "Header (before)" || shots[1].Caption != "Header (after)" {
+		t.Fatalf("captions = %q, %q", shots[0].Caption, shots[1].Caption)
+	}
+	if shots[2].Caption != "Dialog" || shots[2].Name != "combined.png" {
+		t.Fatalf("combined shot = %+v, want the single image kept as is", shots[2])
+	}
+}
+
+func TestCollectScreenshotsSkipsMissingPair(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "after.png"), "after")
+
+	app, calls := newUploadApp(t, "en")
+	manifest := ResultManifest{Screenshots: []json.RawMessage{
+		json.RawMessage(`{"caption":"Gone","before":"missing.png","after":"after.png"}`),
+	}}
+	shots := collectScreenshots(context.Background(), app, 7, dir, manifest)
+
+	if len(shots) != 0 || *calls != 0 {
+		t.Fatalf("shots = %d, uploads = %d, want nothing uploaded for a broken pair", len(shots), *calls)
+	}
+}
+
+func TestScreenshotsMarkdownSeparatesShots(t *testing.T) {
+	md := screenshotsMarkdown([]Shot{
+		{Caption: "顶部工具栏（改动前）", URL: "https://example.com/a.png"},
+		{Caption: "顶部工具栏（改动后）", URL: "https://example.com/b.png"},
+	})
+	for _, want := range []string{"顶部工具栏（改动前）", "https://example.com/a.png", "https://example.com/b.png"} {
+		if !strings.Contains(md, want) {
 			t.Fatalf("markdown missing %q: %s", want, md)
 		}
+	}
+	if !strings.Contains(md, "\n\n---\n\n") {
+		t.Fatalf("markdown should separate shots with a rule: %s", md)
+	}
+	if strings.Contains(md, "上：改动前") {
+		t.Fatalf("markdown should not claim a stacked composite: %s", md)
 	}
 	if screenshotsMarkdown(nil) != "" {
 		t.Fatal("empty shots should produce empty markdown")
 	}
-}
-
-func contains(haystack, needle string) bool {
-	return len(haystack) >= len(needle) && (haystack == needle || indexOf(haystack, needle) >= 0)
-}
-
-func indexOf(haystack, needle string) int {
-	for i := 0; i+len(needle) <= len(haystack); i++ {
-		if haystack[i:i+len(needle)] == needle {
-			return i
-		}
-	}
-	return -1
 }

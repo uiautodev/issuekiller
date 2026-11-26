@@ -163,7 +163,7 @@ dependencies.
 | `release.go` | opt-in periodic releases: version tag parsing, commit classification, bumping and publishing |
 | `selfupdate.go` | release asset selection, checksum verification, binary replacement, 30 min polling |
 | `logs.go` | rotating log file, `-logs` follower |
-| `shots.go` | screenshot collection, before/after composition, upload |
+| `shots.go` | screenshot collection, before/after upload, markdown rendering |
 | `proxy.go` | SOCKS5/HTTP proxies for HTTP clients, git and child processes |
 | `wizard.go` | `-init` interactive setup |
 | `web.go`, `web/dist` | loopback dashboard; embeds the SvelteKit build and serves it with an SPA fallback: `/api/state`, `/api/issue`, `/api/logs`, `/api/action`, `/api/open-url`, `/api/auth*` |
@@ -482,9 +482,10 @@ runs with its own timeout, output tail and exit code, collected into
 `tests`, `screenshots`, `prTitle`, `prBody`, `abort`).
 
 Screenshots are only expected for user-visible UI changes: the agent captures
-the changed region before/after, `shots.go` stacks them (before above after) with a
-divider, uploads through GitHub’s user-attachments endpoint, and the result is
-embedded in the PR and the comment. Backend/docs/test changes must not produce
+the changed region before/after, `shots.go` uploads both images through GitHub’s
+user-attachments endpoint as separate shots, and `screenshotsMarkdown` puts them
+in the PR and the comment separated by a `---` rule (a tall composite is scaled
+down until the UI is unreadable). Backend/docs/test changes must not produce
 screenshots.
 
 UI verification is tool-agnostic on purpose: prompts ask for real browser or
@@ -841,7 +842,7 @@ keeps tests quiet. Notable coverage:
 | `prompts_test.go` | every embedded prompt loads and keeps its placeholders |
 | `triage_test.go` | mode normalization, plan/build routing, triage answer parsing, explicit plan requests, direct-build start |
 | `runner_test.go` | per-agent argv construction, overlong-record draining, stage timeout and stall kill |
-| `shots_test.go` | before/after composition and screenshot markdown |
+| `shots_test.go` | separate before/after uploads, locale-suffixed captions, single-image and broken-pair handling, screenshot markdown with a `---` rule |
 | `plan_test.go` | plan text trimming |
 | `watch_test.go` | config reload fires on valid edits, ignores invalid ones |
 | `watcher_test.go` | `Store` round-trip, `ReviewedSHA` persistence for auto-review dedup, `ReviewPhase` persistence with an empty issue phase |

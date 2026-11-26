@@ -610,7 +610,7 @@ func doRevise(ctx context.Context, app *AppContext, trigger Trigger, issue Issue
 	manifest := loadManifest(runDir)
 	var shots []Shot
 	if manifest.UIChanged != nil && *manifest.UIChanged {
-		shots = collectScreenshots(ctx, app.GH, runDir, manifest, app.RepoInfo.ID, app.Log)
+		shots = collectScreenshots(ctx, app, number, runDir, manifest)
 	}
 	app.Store.UpdateIssue(app.Repo.FullName, number, func(state *IssueState) {
 		state.Phase = "pr_open"
@@ -1135,7 +1135,7 @@ func doModifyPR(ctx context.Context, app *AppContext, trigger Trigger, pr PullRe
 		"",
 		checksSummary(app.language(number), checkResults),
 	}
-	if shotsMD := screenshotsMarkdown(collectScreenshots(ctx, app.GH, runDir, manifest, app.RepoInfo.ID, app.Log)); shotsMD != "" {
+	if shotsMD := screenshotsMarkdown(collectScreenshots(ctx, app, number, runDir, manifest)); shotsMD != "" {
 		body = append(body, "", app.text(number, "common.screenshots"), "", shotsMD)
 	}
 	body = append(body, "", fmt.Sprintf(app.text(number, "modify.done.hint"), app.AgentLogin))
@@ -1390,7 +1390,7 @@ func doImplement(ctx context.Context, app *AppContext, trigger Trigger, issue Is
 	uiChanged := (manifest.UIChanged != nil && *manifest.UIChanged) || (manifest.UIChanged == nil && uiFiles > 0)
 	var shots []Shot
 	if uiChanged {
-		shots = collectScreenshots(ctx, app.GH, runDir, manifest, app.RepoInfo.ID, app.Log)
+		shots = collectScreenshots(ctx, app, number, runDir, manifest)
 	}
 	shotsMD := screenshotsMarkdown(shots)
 	uiNote := ""
