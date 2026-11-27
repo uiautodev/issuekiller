@@ -37,8 +37,9 @@ flowchart LR
 ```
 
 Failing checks are repaired automatically; only an exhausted budget parks the
-issue as `blocked`. Closing it cancels the task and closes the PR; reopening
-resumes it.
+issue as `blocked`. Closing it cancels the task and closes the PR; reopening a
+cancelled issue starts fresh planning, even if an older plan exists, and
+forgets the closed PR.
 
 With the default `mode: auto`, the agent triages each issue and a clear request
 skips the plan comment and goes straight to implementation; `mode: plan` always
@@ -225,9 +226,16 @@ issue tasks; finished reviews follow the hide-finished toggle.
 Every accepted 👍 gets an 👀 reaction immediately, so you can see the daemon
 picked it up while the work is still running.
 
-Commands must come from an approver, mention the agent, and be the **whole
-comment**. Approval words, status labels and review rules live in
-[DEPLOY.md](DEPLOY.md) and [DEVELOP.md](DEVELOP.md).
+Commands must come from an approver and mention the agent. Quoted lines are
+ignored when parsing, so a quote-reply that ends in a command works; quote replies
+with prose also reach the plan/PR feedback routes without a fresh mention.
+The bot also answers approver comments that @ the agent and are not commands:
+a bare mention is acknowledged, a question on a blocked task is answered with
+the failure reason, substantive notes are filed for the retry, and thanks or
+confirmation chatter gets the retry hint instead of silence.
+@-mentions from anyone else only get an 👀 acknowledgment, never an action.
+Approval words, status labels and review rules live in [DEPLOY.md](DEPLOY.md)
+and [DEVELOP.md](DEVELOP.md).
 
 ## Configuration
 

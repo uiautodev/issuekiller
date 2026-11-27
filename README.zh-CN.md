@@ -35,8 +35,7 @@ flowchart LR
     linkStyle 3 stroke:#e11d48,stroke-width:1.5px
 ```
 
-本地检查和 PR 上的 CI 检查失败会自动修，轮次用完才停在 `blocked`；关闭 issue 会
-取消任务并关掉 PR，重新打开会接着做。
+本地检查和 PR 上的 CI 检查失败会自动修，轮次用完才停在 `blocked`；关闭 issue 会取消任务并关掉 PR。重新打开已取消的 issue 会重新规划，即使旧计划还在也会重新开始，并忘掉已关闭的旧 PR。
 
 默认的 `mode: auto` 会让 agent 先判断需求：写得很清楚就直接实现、跳过计划评论；
 `mode: plan` 总是先发计划，`mode: build` 总是不发计划。详见[完整配置项](DEPLOY.md#41-configuration-reference)。
@@ -184,8 +183,12 @@ go build -o bin/issuekiller ./cmd/issuekiller
 
 每个被接受的 👍 都会立刻收到一个 👀 回应，任务还在排队或执行时也能看到已经收到。
 
-命令必须来自 approver、@ 了 agent，并且**整条评论就是命令**。批准词、状态标签
-和 review 的完整规则见 [DEPLOY.md](DEPLOY.md) 和 [DEVELOP.md](DEVELOP.md)。
+命令必须来自 approver、@ 了 agent。解析时会忽略引用行，因此引用回复末尾
+跟命令仍可生效；引用回复带有自己的文字时，也会进入计划/PR 反馈流程，无需重新 @。
+bot 也会回复 @ 了它但不是命令的 approver 评论：只 @ 一下会收到确认，blocked 任务上的问题会用失败原因
+作答，有实质内容的补充会记下来留给重试，纯感谢/确认闲聊也会收到重试提示而不是被忽略。其他人 @ bot
+只会得到一个 👀 确认，不会触发任何动作。批准词、状态标签和 review 完整规则见
+[DEPLOY.md](DEPLOY.md) 和 [DEVELOP.md](DEVELOP.md)。
 
 ## 配置
 

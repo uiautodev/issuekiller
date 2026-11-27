@@ -232,6 +232,13 @@ is re-read from the API before acting, and deliveries are de-duplicated.
 | `apply`, `apply review`, `应用` (the target is a pull request) | apply the latest bot review's findings without a new review |
 | `<approval word> <free text>` (`ok`, `yes`, `go`, …) | approve **and** forward the rest as `ExtraNotes` to the implementation |
 
+Quoted lines are stripped before commands are parsed (`stripQuotedLines`): a
+quote-reply that ends in `@agent continue` parses as the command, while a
+mention inside a quote alone does not count. For non-command feedback on a
+pending plan or open PR, an approver's prose after a bot quote counts as
+feedback even without a fresh mention; a quote-only reply stays silent. The
+full body is still what the coding agent sees in the issue comments.
+
 Other rules:
 
 - A mention on an issue in phase `new`/empty starts planning; `bug`-labelled
@@ -275,8 +282,10 @@ Other rules:
 - An `edited` issue comment is reprocessed only when its new body mentions the
   agent (`Trigger.Reprocess`), so adding the mention after the fact still
   reaches the daemon; other edits stay silent.
-- Closing an issue cancels the task and closes the PR; reopening resumes. A
-  reopened `done` issue starts from `new`.
+- Closing an issue cancels the task and closes the PR. Reopening a cancelled
+  issue clears its cancelled state, PR/branch/worktree metadata and blocked
+  reason, then starts a fresh planning pass even if an older plan exists;
+  reopening a `done` issue starts from `new`.
 - 👍 on the stored `PRCommentID` merges, but only while phase is `pr_open`.
 - Accepting an approval or merge moves the phase immediately (`awaiting_approval`
   → `implementing`, `pr_open` → `merging`) before the job runs. The worker is
@@ -313,6 +322,26 @@ Other rules:
   `Store.IssueNumbers` instead of listing every open issue: with 7 repos the
   listing alone cost ~3200 requests/hour, the token hit its 5000/h core limit,
   and for the rest of that hour polls returned 403 so a 👍 stayed invisible.
+- The bot answers instead of staying silent. 👀 means "seen": every approver
+  comment on a tracked issue gets one, and so does any @-mention from anyone
+  else. A text reply or an action still needs an approver @-mention
+  (`handleUnroutedComment`): a bare `@agent` gets a short acknowledgment, a
+  question on a blocked issue is answered with the last lines of the stored
+  failure reason (bounded and fence-safe), other instructions on a blocked
+  issue are appended to `ExtraNotes` for the retry, comments while work runs or
+  merges get a short acknowledgment, and comments on a done or cancelled issue
+  explain how to continue. A terminal `?`/`？` (excluding polite imperatives
+  such as “Can you add a test?”, but not “Could you tell me why it failed?”) or
+  a question particle counts as a question; URL query punctuation does not.
+  Other substantive text is saved as notes; pure thanks/confirmation chatter on
+  a blocked issue gets the retry hint instead of silence. A note keeps its
+  newest 40 lines and `ExtraNotes` its newest 55 KB, and an edited comment that
+  was already filed does not append the same text again. A comment that is only
+  a quote has nothing new to answer and stays silent; quote replies with prose
+  count as feedback without requiring a fresh mention, while commands are still
+  parsed only from unquoted text.
+  Reply bodies come from the `router.reply.*` scaffold keys, never from the
+  comment text, so a stranger's words can never steer what the bot writes.
 
 ## 7. Job scheduler (`router.go`)
 
@@ -869,7 +898,8 @@ keeps tests quiet. Notable coverage:
 | `router_ci_test.go` | the CI queue does not block work; cancel stops CI jobs |
 | `gh_test.go` | label transitions and GitHub helpers |
 | `release_test.go` | version tag parsing, bump rules, commit classification, due check (calendar days and configured time), slot wake-up time (vs. the hourly cap), time parsing/defaults, release request body, disabled/not-due/no-commit skips |
-| `main_test.go` | proxy/env parsing, repo normalization (names, objects, object arrays), mentions and commands, closable phases, state-dir adoption of `~/.gh-issue-killer`, legacy env fallbacks, the `autoReview` default and opt-out |
+| `main_test.go` | proxy/env parsing, repo normalization (names, objects, object arrays), mentions and commands, quote stripping, question heuristic, closable phases, state-dir adoption of `~/.gh-issue-killer`, legacy env fallbacks, the `autoReview` default and opt-out |
+| `comment_reply_test.go` | quote-reply commands, fall-through replies (bare mention, blocked question/notes/chatter, running/done/cancelled), note bounds and edit dedupe, non-approver mentions get 👀 only |
 | `prompts_test.go` | every embedded prompt loads and keeps its placeholders |
 | `triage_test.go` | mode normalization, plan/build routing, triage answer parsing, explicit plan requests, direct-build start |
 | `runner_test.go` | per-agent argv construction, overlong-record draining, stage timeout and stall kill |
