@@ -72,6 +72,8 @@ posts the plan, `mode: build` always skips it. See the
   a red or stuck PR check goes back to the agent too, and only an exhausted
   budget parks the issue as `blocked`. A task parked by failed checks resumes by
   itself once the PR's checks turn green.
+  A restart also resumes merges interrupted after they enter the `merging` phase
+  (once per PR per daemon run), including merges started with 👍.
 - **Driven by one comment.** Approve, change a PR, resolve conflicts, merge or
   cancel with a comment or 👍 — on any PR in a watched repo, not only its own.
 - **Multi-repo, no cross-blocking.** Each repository has its own agent, model,

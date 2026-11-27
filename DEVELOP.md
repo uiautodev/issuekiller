@@ -516,10 +516,35 @@ as `blocked` and the message says how many attempts ran.
 
 CI-blocked tasks are marked with `BlockedByCI: true`. `retryBlockedCI`, part of
 the 30 s poll, watches them: when the PR is open, not conflicting, and every
-check run finished green, it clears the flag and re-runs the merge path, so a
-transient CI failure does not need a manual `合并`. Other blocked reasons (local
-checks, an unreproducible bug, exhausted conflict rounds) never resume on their
-own.
+check run finished green, it queues the merge path but leaves the flag set until
+that job runs. A lost queued job is therefore picked up by a later scan while
+the phase is still `blocked`, provided `BlockedByCI` remains true. A phase
+`merging` issue with a PR number is resumed regardless of `BlockedByCI` (plain
+thumbs-up merges included), once no job owns the issue. That resume is one-shot
+per daemon process and PR: the mark is written when the job actually re-enters
+`doMerge`, and a job that exits through an early guard clears it, so a transient
+`GetIssue`/`GetPR` failure stays retryable instead of consuming the attempt. If
+the job leaves `merging` behind again after entering `doMerge` (a panic, a
+persistent API error) later polls do not re-enqueue, so a broken merge cannot
+restart every 30 s; a restarted daemon, or a new PR after a reopen, gets one
+fresh attempt. The merge path finishes an already-merged PR exactly like a
+successful merge: it closes the GitHub issue when still open, records
+`MergedAt`, posts the merge-done comment and removes the worktree, so the next
+poll does not mistake the still-open `done` issue for a reopen. The daemon's PR
+body carries `Closes #N`, so GitHub closes the issue as soon as the merge lands;
+the realistic crash state is therefore a closed issue with `phase=merging`. The
+resume finishes that state through the merged PR, or cancels and cleans up a
+closed issue whose PR did not merge. A closed issue is terminal in `blocked`
+too: the retry completes a merged PR or cancels and cleans up an unmerged one,
+so a missed `issue.closed` delivery cannot re-arm the job every poll. The flag
+stays set when a retry for a still-open issue exits through an early guard (a
+changed phase, a missing PR, a failed `GetIssue`) and when the merge re-blocks on
+CI after running, so those outcomes remain retryable. `doMerge` owns the
+terminal phase and flag: every non-CI outcome clears `BlockedByCI`, while a CI
+re-block keeps it set for the next retry. A PR closed without merging while the
+issue is still open cancels and cleans up the task instead of leaving a `done`
+open issue for `wasReopened` to restart. Other blocked reasons (local checks, an
+unreproducible bug, exhausted conflict rounds) never resume on their own.
 
 ## 10. Checks, manifest and screenshots
 
@@ -894,7 +919,7 @@ keeps tests quiet. Notable coverage:
 | `reactions_test.go` | polled 👍 on the review prompt (approver only, consumed once) |
 | `reaction_ack_test.go` | 👀 acknowledgment, status comment id remembered, 👍 on it retries |
 | `poll_scan_test.go` | periodic scans start from tracked issues and cost no request when nothing is pending; the poll auto-review fallback enqueues once per head and is skipped when the repo opts out |
-| `blocked_ci_test.go` | green-check detection, auto-resume of CI-blocked tasks, other reasons untouched |
+| `blocked_ci_test.go` | green-check detection, auto-resume of CI-blocked tasks and interrupted merges, guard exits staying retryable, the per-PR resume bound, a closed issue/closed PR ending the task with cleanup, and the merge-job flag rule, other reasons untouched |
 | `router_ci_test.go` | the CI queue does not block work; cancel stops CI jobs |
 | `gh_test.go` | label transitions and GitHub helpers |
 | `release_test.go` | version tag parsing, bump rules, commit classification, due check (calendar days and configured time), slot wake-up time (vs. the hourly cap), time parsing/defaults, release request body, disabled/not-due/no-commit skips |

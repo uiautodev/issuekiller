@@ -239,6 +239,12 @@ type Router struct {
 	queued     map[string]bool
 	cancels    map[string]context.CancelFunc
 	started    map[string]time.Time
+	// resumed records, per issue, the PR whose interrupted merge this process
+	// already re-entered, so a job that leaves phase=merging behind again
+	// cannot restart every poll. Keying by PR lets a reopened issue that gets a
+	// new PR try its own recovery. A new process starts empty: that is exactly
+	// the restart recovery case.
+	resumed map[string]int
 	// prLocks serializes the jobs that write one pull request's branch; see
 	// serialize.
 	prLocks map[string]*sync.Mutex
@@ -256,6 +262,7 @@ func NewRouter(cfg *Config, contexts map[string]*AppContext, agentLogin string, 
 		queued:     map[string]bool{},
 		cancels:    map[string]context.CancelFunc{},
 		started:    map[string]time.Time{},
+		resumed:    map[string]int{},
 		prLocks:    map[string]*sync.Mutex{},
 	}
 	planWorkers := cfg.PlanParallel
@@ -345,29 +352,40 @@ func (r *Router) worker(jobs <-chan routerJob) {
 	}
 }
 
-func (r *Router) enqueue(fullName, key string, stage jobStage, fn func(context.Context)) {
+// enqueue reserves a job key and sends the job to its stage queue. It returns
+// false when another job already owns the key or the repository has no pool,
+// so a caller can avoid moving state for work that was dropped.
+func (r *Router) enqueue(fullName, key string, stage jobStage, fn func(context.Context)) bool {
+	return r.enqueueBefore(fullName, key, stage, nil, fn)
+}
+
+// enqueueBefore is enqueue with a hook that runs once the key is reserved but
+// before the job can start. Callers use it to move the issue phase only when
+// the job is actually accepted: a duplicate dropped by the dedup must not
+// leave a phase whose owner (the job holding the key) never runs.
+func (r *Router) enqueueBefore(fullName, key string, stage jobStage, before func(), fn func(context.Context)) bool {
 	jobCtx, cancel := context.WithCancel(context.Background())
 	r.mu.Lock()
 	if r.active[key] || r.queued[key] {
 		r.mu.Unlock()
 		cancel()
 		r.log.Debug("skip duplicate job %s", key)
-		return
+		return false
+	}
+	pool := r.pools[fullName]
+	if pool == nil {
+		r.mu.Unlock()
+		cancel()
+		r.log.Warn("no job pool for repo %s; dropping %s", fullName, key)
+		return false
 	}
 	r.queued[key] = true
 	r.cancels[key] = cancel
 	r.mu.Unlock()
-	r.log.Debug("enqueue job %s", key)
-	pool := r.pools[fullName]
-	if pool == nil {
-		cancel()
-		r.mu.Lock()
-		delete(r.queued, key)
-		delete(r.cancels, key)
-		r.mu.Unlock()
-		r.log.Warn("no job pool for repo %s; dropping %s", fullName, key)
-		return
+	if before != nil {
+		before()
 	}
+	r.log.Debug("enqueue job %s", key)
 	queue := pool.work
 	switch stage {
 	case stagePlan:
@@ -376,6 +394,7 @@ func (r *Router) enqueue(fullName, key string, stage jobStage, fn func(context.C
 		queue = pool.ci
 	}
 	queue <- routerJob{key: key, ctx: jobCtx, fn: r.serialize(fullName, key, stage, fn)}
+	return true
 }
 
 // serialize holds one lock per pull request for the whole work job. The issue
@@ -418,6 +437,10 @@ func (r *Router) lockPR(fullName string, number int) func() {
 	}
 	key := fmt.Sprintf("%s#%d", fullName, number)
 	r.mu.Lock()
+	// A zero Router (constructed directly, as the tests do) has no map yet.
+	if r.prLocks == nil {
+		r.prLocks = map[string]*sync.Mutex{}
+	}
 	lock := r.prLocks[key]
 	if lock == nil {
 		lock = &sync.Mutex{}
@@ -723,14 +746,39 @@ func (r *Router) enqueueAutoReview(ctx context.Context, app *AppContext, pr Pull
 }
 
 // retryBlockedCI resumes a task that was parked because its pull request checks
-// failed, once those checks are green. Other blocked reasons (local checks, an
+// failed, once those checks are green, and resumes a merge interrupted after
+// the phase moved to merging. Other blocked reasons (local checks, an
 // unreproducible bug, exhausted conflict rounds) stay parked for the user.
 func (r *Router) retryBlockedCI(ctx context.Context, app *AppContext) {
-	// Same reason as checkReactions: only a tracked, CI-blocked issue can be
-	// resumed, so the scan starts from the state instead of listing the repo.
+	// Only tracked issues with a PR can be resumed, so the scan starts from
+	// state instead of listing the repo.
 	for _, number := range app.Store.IssueNumbers(app.Repo.FullName) {
 		st := r.store.Issue(app.Repo.FullName, number)
-		if st.Phase != "blocked" || !st.BlockedByCI || st.PRNumber == 0 {
+		if st.PRNumber == 0 {
+			continue
+		}
+		key := fmt.Sprintf("%s#%d", app.Repo.FullName, number)
+		if r.jobPending(key) {
+			// The retry (or another action for this issue) already owns the key;
+			// no scan work is useful until it finishes.
+			continue
+		}
+		if st.Phase == "merging" {
+			// A daemon death inside doMerge leaves the phase here, and both job
+			// maps are empty after a restart. Re-enter doMerge, which finishes an
+			// already-merged PR through its pr.State != "open" path. One attempt
+			// per process and PR is enough for that recovery; a merge that keeps
+			// panicking must not restart on every poll.
+			if r.resumeAlreadyTried(key, st.PRNumber) {
+				r.log.Debug("interrupted merge %s#%d was already resumed by this process", app.Repo.FullName, number)
+				continue
+			}
+			if r.enqueue(app.Repo.FullName, key, stageWork, r.retryBlockedCIMergeJob(app, number)) {
+				r.log.Info("interrupted merge %s#%d has no running job; resuming", app.Repo.FullName, number)
+			}
+			continue
+		}
+		if !st.BlockedByCI || st.Phase != "blocked" {
 			continue
 		}
 		pr, err := app.GH.GetPR(ctx, app.Repo.FullName, st.PRNumber)
@@ -741,27 +789,118 @@ func (r *Router) retryBlockedCI(ctx context.Context, app *AppContext) {
 		if err != nil || !checksAllGreen(runs) {
 			continue
 		}
-		r.log.Info("blocked task %s#%d has green checks; retrying the merge", app.Repo.FullName, number)
-		app.Store.UpdateIssue(app.Repo.FullName, number, func(state *IssueState) {
-			state.BlockedByCI = false
-		})
-		r.enqueue(app.Repo.FullName, fmt.Sprintf("%s#%d", app.Repo.FullName, number), stageWork, func(jobCtx context.Context) {
-			issue, err := app.GH.GetIssue(jobCtx, app.Repo.FullName, number)
-			if err != nil || issue.State != "open" {
-				return
-			}
-			current := r.store.Issue(app.Repo.FullName, number)
-			if current.Phase != "blocked" || current.PRNumber == 0 {
-				return
-			}
-			doMerge(jobCtx, app, Trigger{
-				Type:        "retry",
-				IssueNumber: number,
-				Sender:      r.agentLogin,
-				Key:         fmt.Sprintf("retry-%d", time.Now().UnixNano()),
-			}, issue, current)
-		})
+		if r.enqueue(app.Repo.FullName, key, stageWork, r.retryBlockedCIMergeJob(app, number)) {
+			r.log.Info("blocked task %s#%d has green checks; retrying the merge", app.Repo.FullName, number)
+		}
 	}
+}
+
+// retryBlockedCIMergeJob is the job body shared by a CI-blocked retry and the
+// resume of an interrupted merge. A guard exit on a blocked task leaves
+// BlockedByCI set so the next scan can try again; doMerge owns the terminal
+// phase and flag. A resume is marked only when the job reaches doMerge, and the
+// guards clear the mark, so a transient GetIssue/GetPR failure stays retryable
+// instead of consuming the process's one attempt.
+func (r *Router) retryBlockedCIMergeJob(app *AppContext, number int) func(context.Context) {
+	key := fmt.Sprintf("%s#%d", app.Repo.FullName, number)
+	return func(jobCtx context.Context) {
+		issue, err := app.GH.GetIssue(jobCtx, app.Repo.FullName, number)
+		if err != nil {
+			r.clearResumed(key)
+			r.log.Warn("blocked CI retry %s#%d stopped: get issue: %v", app.Repo.FullName, number, err)
+			return
+		}
+		current := r.store.Issue(app.Repo.FullName, number)
+		if issue.State != "open" {
+			if current.Phase == "blocked" || current.Phase == "merging" {
+				// The daemon's PR body contains "Closes #N", so GitHub closes
+				// the issue as soon as the merge lands. A closed issue is
+				// terminal in either phase: finish an already-merged PR, or
+				// cancel and clean up one that did not merge. Otherwise a
+				// missed issue.closed delivery would re-arm this job forever.
+				r.finishClosedMerge(jobCtx, app, number, issue, current)
+				return
+			}
+			r.clearResumed(key)
+			r.log.Warn("blocked CI retry %s#%d stopped: issue is %s", app.Repo.FullName, number, issue.State)
+			return
+		}
+		if current.Phase != "blocked" && current.Phase != "merging" {
+			r.clearResumed(key)
+			r.log.Warn("blocked CI retry %s#%d stopped: phase changed to %q", app.Repo.FullName, number, current.Phase)
+			return
+		}
+		if current.PRNumber == 0 {
+			r.clearResumed(key)
+			r.log.Warn("blocked CI retry %s#%d stopped: no PR", app.Repo.FullName, number)
+			return
+		}
+		if current.Phase == "merging" {
+			// Now the process has really re-entered doMerge: a crash from here
+			// on is bounded to one resume per PR per process.
+			r.markResumed(key, current.PRNumber)
+		}
+		doMerge(jobCtx, app, Trigger{
+			Type:        "retry",
+			IssueNumber: number,
+			Sender:      r.agentLogin,
+			Key:         fmt.Sprintf("retry-%d", time.Now().UnixNano()),
+		}, issue, current)
+	}
+}
+
+// finishClosedMerge resolves a retry or resume whose issue GitHub already
+// closed. A merged PR is completed like any successful merge; an unmerged PR
+// means the issue was closed by a human, so the task is cancelled and cleaned
+// up instead of leaving its phase behind for the next poll.
+func (r *Router) finishClosedMerge(ctx context.Context, app *AppContext, number int, issue Issue, st IssueState) {
+	if st.PRNumber != 0 {
+		pr, err := app.GH.GetPR(ctx, app.Repo.FullName, st.PRNumber)
+		if err != nil {
+			r.clearResumed(fmt.Sprintf("%s#%d", app.Repo.FullName, number))
+			r.log.Warn("blocked CI retry %s#%d stopped: get PR: %v", app.Repo.FullName, number, err)
+			return
+		}
+		if pr.Merged {
+			finishMergedIssue(ctx, app, number, st)
+			return
+		}
+	}
+	r.log.Info("closed issue %s#%d: PR is not merged; cancelling", app.Repo.FullName, number)
+	doCloseIssue(ctx, app, issue, st)
+}
+
+// resumeAlreadyTried reports whether this process already re-entered doMerge
+// for the issue's current PR.
+func (r *Router) resumeAlreadyTried(key string, prNumber int) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return prNumber != 0 && r.resumed[key] == prNumber
+}
+
+func (r *Router) markResumed(key string, prNumber int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.resumed == nil {
+		r.resumed = map[string]int{}
+	}
+	r.resumed[key] = prNumber
+}
+
+// clearResumed forgets an old resume when a fresh merge starts, so an issue
+// reopened and merged again in the same process still gets its recovery.
+func (r *Router) clearResumed(key string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.resumed, key)
+}
+
+// jobPending reports whether a job currently owns the key, either running or
+// waiting in its queue.
+func (r *Router) jobPending(key string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.active[key] || r.queued[key]
 }
 
 // checksAllGreen reports whether every check run finished successfully.
@@ -1020,21 +1159,22 @@ func (r *Router) WebCancel(repo string, number int) error {
 
 func (r *Router) enqueueApprove(ctx context.Context, app *AppContext, fullName string, number int, sender string) {
 	key := fmt.Sprintf("%s#%d", fullName, number)
-	// The owner already approved: clear the waiting label and move the phase
-	// now, even if the implementation is still queued behind another job.
-	// Otherwise the issue keeps looking like it needs confirmation and the
-	// poller keeps re-approving the same 👍 on every scan.
-	app.GH.SetAgentState(ctx, fullName, number, workingLabel)
-	app.Store.UpdateIssue(fullName, number, func(state *IssueState) {
-		state.Phase = "implementing"
-	})
 	trigger := Trigger{
 		Type:        "reaction",
 		IssueNumber: number,
 		Sender:      sender,
 		Key:         fmt.Sprintf("approve-%d", time.Now().UnixNano()),
 	}
-	r.enqueue(fullName, key, stageWork, func(jobCtx context.Context) {
+	r.enqueueBefore(fullName, key, stageWork, func() {
+		// The owner already approved: clear the waiting label and move the phase
+		// as soon as the job is accepted, even if the implementation is still
+		// queued behind another job. Otherwise the issue keeps looking like it
+		// needs confirmation and the poller keeps re-approving the same 👍.
+		app.GH.SetAgentState(ctx, fullName, number, workingLabel)
+		app.Store.UpdateIssue(fullName, number, func(state *IssueState) {
+			state.Phase = "implementing"
+		})
+	}, func(jobCtx context.Context) {
 		issue, err := app.GH.GetIssue(jobCtx, fullName, number)
 		if err != nil {
 			blockIssue(jobCtx, app, number, err)
@@ -1053,18 +1193,21 @@ func (r *Router) enqueueApprove(ctx context.Context, app *AppContext, fullName s
 
 func (r *Router) enqueueMerge(app *AppContext, fullName string, number int, sender string) {
 	key := fmt.Sprintf("%s#%d", fullName, number)
-	// Move out of pr_open now: the merge may queue behind other work and the
-	// poller must not re-merge the same 👍 every 30 s.
-	app.Store.UpdateIssue(fullName, number, func(state *IssueState) {
-		state.Phase = "merging"
-	})
 	trigger := Trigger{
 		Type:        "reaction",
 		IssueNumber: number,
 		Sender:      sender,
 		Key:         fmt.Sprintf("merge-%d", time.Now().UnixNano()),
 	}
-	r.enqueue(fullName, key, stageWork, func(jobCtx context.Context) {
+	r.enqueueBefore(fullName, key, stageWork, func() {
+		// Move out of pr_open once the merge is actually queued: it may wait
+		// behind other work and the poller must not re-merge the same 👍 every
+		// 30 s. A duplicate dropped by the dedup leaves the phase to its owner.
+		r.clearResumed(key)
+		app.Store.UpdateIssue(fullName, number, func(state *IssueState) {
+			state.Phase = "merging"
+		})
+	}, func(jobCtx context.Context) {
 		issue, err := app.GH.GetIssue(jobCtx, fullName, number)
 		if err != nil {
 			blockIssue(jobCtx, app, number, err)
@@ -1305,6 +1448,7 @@ func (r *Router) HandleTrigger(ctx context.Context, fullName string, trigger Tri
 					return
 				}
 				r.waitCISettle(jobCtx, fullName, trigger.IssueNumber)
+				r.clearResumed(key)
 				doMerge(jobCtx, app, trigger, issue, st)
 			})
 			return

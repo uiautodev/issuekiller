@@ -121,6 +121,7 @@ type PullRequest struct {
 	Number              int    `json:"number"`
 	HTMLURL             string `json:"html_url"`
 	State               string `json:"state"`
+	Merged              bool   `json:"merged"`
 	Draft               bool   `json:"draft"`
 	Title               string `json:"title"`
 	Body                string `json:"body"`
