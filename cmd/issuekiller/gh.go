@@ -755,7 +755,7 @@ func (g *GH) JobLogTail(ctx context.Context, fullName string, jobID int64, lines
 	if err != nil {
 		return ""
 	}
-	request.Header.Set("Authorization", "Bearer "+g.Token)
+	request.Header.Set("Authorization", "Bearer "+g.currentToken())
 	request.Header.Set("Accept", "application/vnd.github+json")
 	request.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 	request.Header.Set("User-Agent", "issuekiller-go/0.1")
@@ -896,7 +896,7 @@ func (g *GH) UploadAttachment(ctx context.Context, repoID int64, file string) (s
 		return "", err
 	}
 	request.ContentLength = info.Size()
-	request.Header.Set("Authorization", "Bearer "+g.Token)
+	request.Header.Set("Authorization", "Bearer "+g.currentToken())
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("Content-Type", "application/octet-stream")
 	request.Header.Set("User-Agent", "issuekiller-go/0.1")

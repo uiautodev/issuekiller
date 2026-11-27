@@ -14,22 +14,60 @@ import (
 )
 
 type AppContext struct {
-	Cfg        *Config
-	Repo       RepoConfig
-	RepoInfo   RepoInfo
-	Local      *LocalRepo
-	Identity   User
-	Token      string
-	Proxy      *Proxy
-	GH         *GH
-	Store      *Store
-	Log        *Logger
-	Env        []string
+	Cfg      *Config
+	Repo     RepoConfig
+	RepoInfo RepoInfo
+	Local    *LocalRepo
+	Identity User
+	Proxy    *Proxy
+	GH       *GH
+	Store    *Store
+	Log      *Logger
+	// AgentLogin is the login of the bot account running the daemon.
 	AgentLogin string
 	// EnqueueCI schedules the post-push CI wait on the router's CI queue so the
 	// implementation slot is released immediately. Nil when there is no router
 	// (tests).
 	EnqueueCI func(number int)
+}
+
+// Env rebuilds the child-process environment with the current token. The bot
+// token rotates (GH refreshes it on 401), so an environment captured at
+// startup would authenticate git and gh with an expired token. GH is the only
+// source in production; a context without a client (tests) gets no token
+// rather than a snapshot that could go stale.
+func (a *AppContext) envWithToken() ([]string, string) {
+	token := ""
+	if a.GH != nil {
+		token = a.GH.currentToken()
+	}
+	overrides := goProxyEnv(a.Proxy)
+	overrides["GH_TOKEN"] = token
+	overrides["GITHUB_TOKEN"] = token
+	return mergeEnv(buildGitEnv(a.Proxy, token, a.Identity), overrides), token
+}
+
+func (a *AppContext) Env() []string {
+	env, _ := a.envWithToken()
+	return env
+}
+
+func (a *AppContext) refreshToken(ctx context.Context, failed string) bool {
+	if a.GH == nil {
+		return false
+	}
+	token, err := a.GH.refreshAfterUnauthorized(ctx, failed)
+	if err != nil {
+		live := a.GH.currentToken()
+		if live != "" && live != failed {
+			return true
+		}
+		if a.Log != nil {
+			a.Log.Warn("git token refresh failed: %v", err)
+		}
+		return false
+	}
+	return token != "" && token != failed
 }
 
 // projectURL is shown on plan comments so readers can find the project.
@@ -257,7 +295,7 @@ func doPlan(ctx context.Context, app *AppContext, trigger Trigger, issue Issue) 
 		Prompt:  prompt,
 		Model:   app.Repo.Model,
 		RunDir:  runDir,
-		Env:     app.Env,
+		Env:     app.Env(),
 		Timeout: app.Cfg.PlanTimeout,
 		LogFile: filepath.Join(runDir, fmt.Sprintf("plan-%s.log", app.Repo.CodingAgent)),
 		Log:     app.Log,
@@ -416,7 +454,7 @@ func shouldBuildDirectly(ctx context.Context, app *AppContext, trigger Trigger, 
 		Prompt:  prompt,
 		Model:   app.Repo.Model,
 		RunDir:  runDir,
-		Env:     app.Env,
+		Env:     app.Env(),
 		Timeout: app.Cfg.PlanTimeout,
 		LogFile: filepath.Join(runDir, fmt.Sprintf("triage-%s.log", app.Repo.CodingAgent)),
 		Log:     app.Log,
@@ -436,7 +474,7 @@ func shouldBuildDirectly(ctx context.Context, app *AppContext, trigger Trigger, 
 
 func runChecksWithFixes(ctx context.Context, app *AppContext, runner CodingRunner, sessionID, worktree, runDir string) ([]CheckResult, bool) {
 	checks := loadChecks(worktree, runDir, app.Log)
-	checkResults, ok := runChecks(ctx, checks, worktree, runDir, app.Env, app.Log)
+	checkResults, ok := runChecks(ctx, checks, worktree, runDir, app.Env(), app.Log)
 	for attempt := 1; !ok && attempt <= app.Cfg.MaxFixRounds; attempt++ {
 		app.Log.Warn("checks failed, fix round %d/%d", attempt, app.Cfg.MaxFixRounds)
 		failures := make([]string, 0)
@@ -463,7 +501,7 @@ func runChecksWithFixes(ctx context.Context, app *AppContext, runner CodingRunne
 			SessionID: sessionID,
 			Model:     app.Repo.Model,
 			RunDir:    runDir,
-			Env:       app.Env,
+			Env:       app.Env(),
 			Timeout:   app.Cfg.ImplementTimeout,
 			LogFile:   filepath.Join(runDir, fmt.Sprintf("fix-%d-%s.log", attempt, app.Repo.CodingAgent)),
 			Log:       app.Log,
@@ -471,7 +509,7 @@ func runChecksWithFixes(ctx context.Context, app *AppContext, runner CodingRunne
 			app.Log.Error("fix round %d failed: %v", attempt, runErr)
 		}
 		checks = loadChecks(worktree, runDir, app.Log)
-		checkResults, ok = runChecks(ctx, checks, worktree, runDir, app.Env, app.Log)
+		checkResults, ok = runChecks(ctx, checks, worktree, runDir, app.Env(), app.Log)
 	}
 	return checkResults, ok
 }
@@ -524,7 +562,7 @@ func doRevise(ctx context.Context, app *AppContext, trigger Trigger, issue Issue
 	// The PR review flow may have pushed a fix to this branch since the
 	// worktree was created; build on the current head instead of failing the
 	// push at the end. The per-PR lock keeps the two from running at once.
-	if err := syncWorktreeBranch(ctx, worktree, app.Local.HTTPSURL, app.Local.Env, st.Branch); err != nil {
+	if err := syncWorktreeBranch(ctx, worktree, app.Local.HTTPSURL, app.Local.gitEnvWithToken, app.Local.refreshToken, st.Branch); err != nil {
 		blockIssue(ctx, app, number, err)
 		return
 	}
@@ -564,7 +602,7 @@ func doRevise(ctx context.Context, app *AppContext, trigger Trigger, issue Issue
 		SessionID: st.SessionID,
 		Model:     app.Repo.Model,
 		RunDir:    runDir,
-		Env:       app.Env,
+		Env:       app.Env(),
 		Timeout:   app.Cfg.ImplementTimeout,
 		LogFile:   filepath.Join(runDir, fmt.Sprintf("revise-%s.log", app.Repo.CodingAgent)),
 		Log:       app.Log,
@@ -602,7 +640,7 @@ func doRevise(ctx context.Context, app *AppContext, trigger Trigger, issue Issue
 		reportCheckFailures(ctx, app, number, worktree, checkResults)
 		return
 	}
-	if err := commitAll(ctx, worktree, app.Env, fmt.Sprintf("chore: apply feedback for #%d", number)); err != nil {
+	if err := commitAll(ctx, worktree, app.Env(), fmt.Sprintf("chore: apply feedback for #%d", number)); err != nil {
 		blockIssue(ctx, app, number, fmt.Errorf("commit: %w", err))
 		return
 	}
@@ -740,7 +778,7 @@ func doReviewPR(ctx context.Context, app *AppContext, trigger Trigger, pr PullRe
 		Prompt:  prompt,
 		Model:   app.Repo.Model,
 		RunDir:  runDir,
-		Env:     app.Env,
+		Env:     app.Env(),
 		Timeout: app.Cfg.PlanTimeout,
 		LogFile: filepath.Join(runDir, fmt.Sprintf("review-%s.log", app.Repo.CodingAgent)),
 		Log:     app.Log,
@@ -1117,7 +1155,7 @@ func doModifyPR(ctx context.Context, app *AppContext, trigger Trigger, pr PullRe
 		Prompt:  prompt,
 		Model:   app.Repo.Model,
 		RunDir:  runDir,
-		Env:     app.Env,
+		Env:     app.Env(),
 		Timeout: app.Cfg.ImplementTimeout,
 		LogFile: filepath.Join(runDir, fmt.Sprintf("modify-pr-%s.log", app.Repo.CodingAgent)),
 		Log:     app.Log,
@@ -1125,7 +1163,7 @@ func doModifyPR(ctx context.Context, app *AppContext, trigger Trigger, pr PullRe
 		postReviewFailure(ctx, app, number, fmt.Errorf("modify agent: %w", err))
 		return false
 	}
-	if gitStatus(ctx, worktree, app.Env) == "" {
+	if gitStatus(ctx, worktree, app.Env()) == "" {
 		_, _ = app.GH.PostComment(ctx, app.Repo.FullName, number, app.text(number, "modify.nochange"))
 		return false
 	}
@@ -1140,11 +1178,11 @@ func doModifyPR(ctx context.Context, app *AppContext, trigger Trigger, pr PullRe
 		}, "\n"))
 		return false
 	}
-	if err := commitAll(ctx, worktree, app.Env, fmt.Sprintf("chore: apply maintainer instructions for #%d", number)); err != nil {
+	if err := commitAll(ctx, worktree, app.Env(), fmt.Sprintf("chore: apply maintainer instructions for #%d", number)); err != nil {
 		postReviewFailure(ctx, app, number, fmt.Errorf("commit: %w", err))
 		return false
 	}
-	if err := pushBranchTo(ctx, worktree, prPushURL(app, pr), app.Env, branch, pr.Head.Ref); err != nil {
+	if err := pushBranchTo(ctx, worktree, prPushURL(app, pr), app.envWithToken, app.refreshToken, branch, pr.Head.Ref); err != nil {
 		postReviewFailure(ctx, app, number, fmt.Errorf("push to %s: %w", pr.Head.Repo.FullName, err))
 		return false
 	}
@@ -1416,12 +1454,15 @@ func doImplement(ctx context.Context, app *AppContext, trigger Trigger, issue Is
 		blockIssue(ctx, app, number, err)
 		return
 	}
+	// Env is a snapshot taken when the agent starts: an implement run can last
+	// ImplementTimeout, so a rotation during it is not seen by the agent's own
+	// gh/git calls — only the daemon's git operations rebuild per use (§12).
 	result, err := runner.Run(ctx, RunnerOptions{
 		Cwd:     worktree,
 		Prompt:  prompt,
 		Model:   app.Repo.Model,
 		RunDir:  runDir,
-		Env:     app.Env,
+		Env:     app.Env(),
 		Timeout: app.Cfg.ImplementTimeout,
 		LogFile: filepath.Join(runDir, fmt.Sprintf("implement-%s.log", app.Repo.CodingAgent)),
 		Log:     app.Log,
@@ -1463,7 +1504,7 @@ func doImplement(ctx context.Context, app *AppContext, trigger Trigger, issue Is
 		return
 	}
 
-	if err := commitAll(ctx, worktree, app.Env, fmt.Sprintf("chore: finalize changes for #%d", number)); err != nil {
+	if err := commitAll(ctx, worktree, app.Env(), fmt.Sprintf("chore: finalize changes for #%d", number)); err != nil {
 		blockIssue(ctx, app, number, fmt.Errorf("commit: %w", err))
 		return
 	}
@@ -1899,15 +1940,28 @@ func ciGateWithRepairs(ctx context.Context, app *AppContext, issue Issue, st Iss
 	number := issue.Number
 	// A previous round may have left a commit in the worktree without pushing
 	// it (for example an agent that commits on its own). Publish it before
-	// gating, or the gate keeps checking the old head forever.
+	// gating, and fail the gate when that cannot be confirmed: gating the old
+	// head would drop the stranded commit silently, exactly the bug this path
+	// exists to prevent.
 	if st.Worktree != "" && pr.Head.SHA != "" {
-		if ahead, head := worktreeAheadOfPR(ctx, st.Worktree, app.Local, st.Branch, pr.Head.SHA); ahead {
+		ahead, head, aheadErr := worktreeAheadOfPR(ctx, st.Worktree, app.Local, st.Branch, pr.Head.SHA)
+		if aheadErr != nil {
+			return ciVerdict{}, 0, fmt.Errorf("check stranded commits for %s#%d: %w", app.Repo.FullName, number, aheadErr)
+		}
+		if ahead {
 			app.Log.Info("publishing stranded commit %s for %s#%d", shortSHA(head), app.Repo.FullName, number)
-			if err := pushBranch(ctx, st.Worktree, app.Local, st.Branch); err == nil {
-				if refreshed, refreshErr := waitForPRHead(ctx, app, st.PRNumber, head, 2*time.Minute); refreshErr == nil {
-					pr = refreshed
-				}
+			if err := pushBranch(ctx, st.Worktree, app.Local, st.Branch); err != nil {
+				return ciVerdict{}, 0, fmt.Errorf("publish stranded commit %s for %s#%d: %w", shortSHA(head), app.Repo.FullName, number, err)
 			}
+			refreshed, refreshErr := waitForPRHead(ctx, app, st.PRNumber, head, 2*time.Minute)
+			if refreshErr != nil {
+				return ciVerdict{}, 0, fmt.Errorf("get PR after publishing stranded commit %s: %w", shortSHA(head), refreshErr)
+			}
+			if refreshed.Head.SHA != head {
+				return ciVerdict{}, 0, fmt.Errorf("publish stranded commit %s for %s#%d: PR head is still %s",
+					shortSHA(head), app.Repo.FullName, number, shortSHA(refreshed.Head.SHA))
+			}
+			pr = refreshed
 		}
 	}
 	verdict := waitForChecks(ctx, app, pr.Head.SHA, pr.Base.Ref, 10*time.Minute)
@@ -1963,19 +2017,34 @@ func ciGateWithRepairs(ctx context.Context, app *AppContext, issue Issue, st Iss
 
 // worktreeAheadOfPR reports whether the worktree HEAD is a descendant of the
 // given PR commit, i.e. it holds commits that were never pushed.
-func worktreeAheadOfPR(ctx context.Context, worktree string, local *LocalRepo, branch, prSHA string) (bool, string) {
-	head := headSHA(ctx, worktree, local.Env)
+func worktreeAheadOfPR(ctx context.Context, worktree string, local *LocalRepo, branch, prSHA string) (bool, string, error) {
+	head := headSHA(ctx, worktree, local.gitEnv())
 	if head == "" || head == prSHA {
-		return false, ""
+		return false, "", nil
 	}
-	if _, err := gitWorktree(ctx, worktree, local.Env, 2*time.Minute, true, "fetch", local.HTTPSURL, branch); err != nil {
-		return false, ""
+	result, err := gitWithAuthRetry(ctx, worktree, local.gitEnvWithToken, local.refreshToken, 2*time.Minute, false, "fetch", local.HTTPSURL, branch)
+	if err != nil {
+		return false, "", fmt.Errorf("fetch PR branch before checking worktree: %w", err)
 	}
-	ancestor, err := gitWorktree(ctx, worktree, local.Env, 30*time.Second, true, "merge-base", "--is-ancestor", prSHA, "HEAD")
-	if err != nil || ancestor.Code != 0 {
-		return false, ""
+	if result.Code != 0 {
+		return false, "", fmt.Errorf("fetch PR branch before checking worktree: git exited %d: %s", result.Code, strings.TrimSpace(result.Stderr))
 	}
-	return true, head
+	ancestor, err := gitWorktree(ctx, worktree, local.gitEnv(), 30*time.Second, true, "merge-base", "--is-ancestor", prSHA, "HEAD")
+	if err != nil {
+		return false, "", fmt.Errorf("check whether %s is an ancestor of the worktree HEAD: %w", shortSHA(prSHA), err)
+	}
+	// Exit 1 is the only answer that means "not an ancestor". Exit 128 (for
+	// example prSHA is not available locally), a timeout or any other failure
+	// means the check could not run; folding that into "not ahead" drops a
+	// stranded commit without a word.
+	if ancestor.Code == 1 {
+		return false, "", nil
+	}
+	if ancestor.Code != 0 {
+		return false, "", fmt.Errorf("check whether %s is an ancestor of the worktree HEAD: git exited %d: %s",
+			shortSHA(prSHA), ancestor.Code, strings.TrimSpace(ancestor.Stderr))
+	}
+	return true, head, nil
 }
 
 // ciRepairRound runs the coding agent once in the PR's worktree with the
@@ -1990,7 +2059,7 @@ func ciRepairRound(ctx context.Context, app *AppContext, issue Issue, st *IssueS
 	if _, err := os.Stat(filepath.Join(worktree, ".git")); err != nil {
 		return "", false, fmt.Errorf("worktree %s is gone: %w", worktree, err)
 	}
-	beforeHead := headSHA(ctx, worktree, app.Env)
+	beforeHead := headSHA(ctx, worktree, app.Env())
 	runDir := runDirFor(app, issue.Number)
 	_ = os.MkdirAll(filepath.Join(runDir, "screenshots"), 0o755)
 	runner, err := newCodingRunner(app.Repo.CodingAgent)
@@ -2021,7 +2090,7 @@ func ciRepairRound(ctx context.Context, app *AppContext, issue Issue, st *IssueS
 		SessionID: st.SessionID,
 		Model:     app.Repo.Model,
 		RunDir:    runDir,
-		Env:       app.Env,
+		Env:       app.Env(),
 		Timeout:   app.Cfg.ImplementTimeout,
 		LogFile:   filepath.Join(runDir, fmt.Sprintf("ci-fix-%d-%s.log", round, app.Repo.CodingAgent)),
 		Log:       app.Log,
@@ -2039,8 +2108,8 @@ func ciRepairRound(ctx context.Context, app *AppContext, issue Issue, st *IssueS
 	if issueCancelled(app, issue.Number) {
 		return "", false, nil
 	}
-	dirty := gitStatus(ctx, worktree, app.Env) != ""
-	head := headSHA(ctx, worktree, app.Env)
+	dirty := gitStatus(ctx, worktree, app.Env()) != ""
+	head := headSHA(ctx, worktree, app.Env())
 	if !dirty && head == beforeHead {
 		return "", false, nil
 	}
@@ -2051,12 +2120,12 @@ func ciRepairRound(ctx context.Context, app *AppContext, issue Issue, st *IssueS
 	if !ok {
 		return "", false, fmt.Errorf("local checks still fail after CI repair round %d", round)
 	}
-	if gitStatus(ctx, worktree, app.Env) != "" {
-		if err := commitAll(ctx, worktree, app.Env, fmt.Sprintf("fix: make CI green for #%d", issue.Number)); err != nil {
+	if gitStatus(ctx, worktree, app.Env()) != "" {
+		if err := commitAll(ctx, worktree, app.Env(), fmt.Sprintf("fix: make CI green for #%d", issue.Number)); err != nil {
 			return "", false, fmt.Errorf("commit CI repair: %w", err)
 		}
 	}
-	finalHead := headSHA(ctx, worktree, app.Env)
+	finalHead := headSHA(ctx, worktree, app.Env())
 	if finalHead == beforeHead {
 		return "", false, nil
 	}
@@ -2171,7 +2240,7 @@ func resolveMergeConflicts(ctx context.Context, app *AppContext, issue Issue, st
 		return pr, err
 	}
 	updated := pr
-	if head := headSHA(ctx, st.Worktree, app.Env); head != "" {
+	if head := headSHA(ctx, st.Worktree, app.Env()); head != "" {
 		if app.GH.HasWorkflows(ctx, app.Repo.FullName) {
 			// Give GitHub a moment to create the new head's check runs, so the
 			// merge gate does not read "not created yet" as "no CI".
@@ -2260,11 +2329,11 @@ func resolveConflictsIn(ctx context.Context, app *AppContext, target conflictTar
 	if err := fetchBase(ctx, app.Local); err != nil {
 		return fmt.Errorf("fetch %s: %w", app.Local.Base, err)
 	}
-	merge, err := gitWorktree(ctx, worktree, app.Env, 5*time.Minute, true, "merge", "--no-edit", "origin/"+app.Local.Base)
+	merge, err := gitWorktree(ctx, worktree, app.Env(), 5*time.Minute, true, "merge", "--no-edit", "origin/"+app.Local.Base)
 	if err != nil {
 		return fmt.Errorf("git merge %s: %w", app.Local.Base, err)
 	}
-	files := conflictedFiles(ctx, worktree, app.Env)
+	files := conflictedFiles(ctx, worktree, app.Env())
 	if merge.Code != 0 && len(files) == 0 {
 		return fmt.Errorf("git merge %s: %s", app.Local.Base, tailString(merge.Stderr, 10))
 	}
@@ -2296,7 +2365,7 @@ func resolveConflictsIn(ctx context.Context, app *AppContext, target conflictTar
 			SessionID: sessionID,
 			Model:     app.Repo.Model,
 			RunDir:    runDir,
-			Env:       app.Env,
+			Env:       app.Env(),
 			Timeout:   app.Cfg.ImplementTimeout,
 			LogFile:   filepath.Join(runDir, fmt.Sprintf("conflict-%d-%s.log", round, app.Repo.CodingAgent)),
 			Log:       app.Log,
@@ -2308,7 +2377,7 @@ func resolveConflictsIn(ctx context.Context, app *AppContext, target conflictTar
 		if sessionID != "" && target.RememberSession != nil {
 			target.RememberSession(sessionID)
 		}
-		if remaining := conflictedFiles(ctx, worktree, app.Env); len(remaining) > 0 {
+		if remaining := conflictedFiles(ctx, worktree, app.Env()); len(remaining) > 0 {
 			return fmt.Errorf("conflicts remain after the agent: %s", strings.Join(remaining, ", "))
 		}
 		if target.Cancelled != nil && target.Cancelled() {
@@ -2325,10 +2394,10 @@ func resolveConflictsIn(ctx context.Context, app *AppContext, target conflictTar
 	if !ok {
 		return fmt.Errorf("checks failed after resolving conflicts with %s", app.Local.Base)
 	}
-	if err := commitAll(ctx, worktree, app.Env, fmt.Sprintf("chore: resolve conflicts with %s for #%d", app.Local.Base, number)); err != nil {
+	if err := commitAll(ctx, worktree, app.Env(), fmt.Sprintf("chore: resolve conflicts with %s for #%d", app.Local.Base, number)); err != nil {
 		return fmt.Errorf("commit conflict resolution: %w", err)
 	}
-	if err := pushBranchTo(ctx, worktree, target.RemoteURL, app.Env, target.LocalBranch, target.RemoteBranch); err != nil {
+	if err := pushBranchTo(ctx, worktree, target.RemoteURL, app.envWithToken, app.refreshToken, target.LocalBranch, target.RemoteBranch); err != nil {
 		return fmt.Errorf("push conflict resolution: %w", err)
 	}
 	return nil

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -49,8 +50,11 @@ func TestWorktreeAheadOfPR(t *testing.T) {
 	mustGit(work, "commit", "-q", "-m", "local only")
 	localHead := gitOutput(ctx, work, env, time.Minute, "rev-parse", "HEAD")
 
-	local := &LocalRepo{HTTPSURL: remote, Env: env}
-	ahead, head := worktreeAheadOfPR(ctx, work, local, "main", remoteHead)
+	local := &LocalRepo{HTTPSURL: remote}
+	ahead, head, err := worktreeAheadOfPR(ctx, work, local, "main", remoteHead)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ahead {
 		t.Fatal("ahead = false, want true for an unpushed local commit")
 	}
@@ -59,8 +63,21 @@ func TestWorktreeAheadOfPR(t *testing.T) {
 	}
 
 	mustGit(work, "push", "-q", "origin", "main")
-	ahead, _ = worktreeAheadOfPR(ctx, work, local, "main", localHead)
+	ahead, _, err = worktreeAheadOfPR(ctx, work, local, "main", localHead)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if ahead {
 		t.Fatal("ahead = true after the commit was pushed")
+	}
+	if ahead, _, err := worktreeAheadOfPR(ctx, work, local, "missing-branch", remoteHead); err == nil || ahead {
+		t.Fatalf("ahead = %v, err = %v, want fetch failure error", ahead, err)
+	}
+	// Exit 128 from merge-base means the commit is not available locally, not
+	// that the worktree is behind. Folding it into "not ahead" would drop the
+	// stranded commit silently.
+	missingSHA := strings.Repeat("0", 40)
+	if ahead, _, err := worktreeAheadOfPR(ctx, work, local, "main", missingSHA); err == nil || ahead {
+		t.Fatalf("ahead = %v, err = %v, want merge-base failure error", ahead, err)
 	}
 }

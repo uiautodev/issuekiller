@@ -16,7 +16,81 @@ type LocalRepo struct {
 	HTTPSURL     string
 	Base         string
 	WorktreeRoot string
-	Env          []string
+	// proxy, identity and token rebuild the git environment per operation.
+	// The bot token rotates (GH refreshes it on 401), so an environment
+	// captured at startup would keep authenticating git with an expired
+	// token. token is a live source: GH.currentToken in production.
+	proxy    *Proxy
+	identity User
+	token    func() string
+	// refresh rotates the token after git itself met an expired one; it is
+	// GH.refreshAfterUnauthorized in production and nil in tests.
+	refresh func(ctx context.Context, failed string) (string, error)
+}
+
+// gitEnvWithToken builds the git environment and returns the credential used
+// in it, so a 401 refresh is keyed to the failed attempt.
+func (l *LocalRepo) gitEnvWithToken() ([]string, string) {
+	token := ""
+	if l.token != nil {
+		token = l.token()
+	}
+	return buildGitEnv(l.proxy, token, l.identity), token
+}
+
+func (l *LocalRepo) gitEnv() []string {
+	env, _ := l.gitEnvWithToken()
+	return env
+}
+
+func (l *LocalRepo) refreshToken(ctx context.Context, failed string) bool {
+	if l.refresh == nil || l.token == nil {
+		return false
+	}
+	token, err := l.refresh(ctx, failed)
+	if err != nil {
+		live := l.token()
+		return live != "" && live != failed
+	}
+	return token != "" && token != failed
+}
+
+// gitAuthFailed tells an expired-token failure from any other git error. The
+// token is a one-shot extraheader, so GitHub answers 401; with
+// GIT_TERMINAL_PROMPT=0 git can also turn that into a username prompt.
+func gitAuthFailed(result CmdResult) bool {
+	text := strings.ToLower(result.Stderr)
+	for _, marker := range []string{
+		"returned error: 401",
+		"401 unauthorized",
+		"authentication failed",
+		"could not read username",
+		"terminal prompts disabled",
+		"invalid username or password",
+	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// gitWithAuthRetry runs one git command and retries it once with a rebuilt
+// environment when the failure was an expired token. The factory captures the
+// exact credential used by the failed attempt.
+func gitWithAuthRetry(ctx context.Context, cwd string, env func() ([]string, string), rotate func(context.Context, string) bool, timeout time.Duration, allowFailure bool, args ...string) (CmdResult, error) {
+	git, err := gitBinary()
+	if err != nil {
+		return CmdResult{}, err
+	}
+	firstEnv, failedToken := env()
+	opts := CmdOptions{Cwd: cwd, Env: firstEnv, Timeout: timeout, AllowFailure: allowFailure}
+	result, err := runCmd(ctx, git, args, opts)
+	if result.Code == 0 || !gitAuthFailed(result) || rotate == nil || !rotate(ctx, failedToken) {
+		return result, err
+	}
+	opts.Env, _ = env()
+	return runCmd(ctx, git, args, opts)
 }
 
 func gitBinary() (string, error) {
@@ -49,10 +123,23 @@ func buildGitEnv(proxy *Proxy, token string, identity User) []string {
 	return mergeEnv(os.Environ(), overrides, "GH_TOKEN", "GITHUB_TOKEN")
 }
 
-func resolveRepo(ctx context.Context, repo RepoConfig, info RepoInfo, identity User, token string, proxy *Proxy) (*LocalRepo, error) {
-	env := buildGitEnv(proxy, token, identity)
+func resolveRepo(ctx context.Context, repo RepoConfig, info RepoInfo, identity User, token func() string, refresh func(ctx context.Context, failed string) (string, error), proxy *Proxy) (*LocalRepo, error) {
 	httpsURL := fmt.Sprintf("https://github.com/%s.git", repo.FullName)
 	cloneDir := filepath.Join(reposDir(), repo.Owner+"-"+repo.Name)
+	worktreeRoot := repo.WorktreeRoot
+	if worktreeRoot == "" {
+		worktreeRoot = filepath.Join(treesDir(), repo.Owner+"-"+repo.Name)
+	}
+	local := &LocalRepo{
+		Dir:          cloneDir,
+		HTTPSURL:     httpsURL,
+		Base:         info.DefaultBranch,
+		WorktreeRoot: worktreeRoot,
+		proxy:        proxy,
+		identity:     identity,
+		token:        token,
+		refresh:      refresh,
+	}
 	if err := os.MkdirAll(reposDir(), 0o755); err != nil {
 		return nil, err
 	}
@@ -61,15 +148,11 @@ func resolveRepo(ctx context.Context, repo RepoConfig, info RepoInfo, identity U
 		if entries, readErr := os.ReadDir(cloneDir); readErr == nil && len(entries) > 0 {
 			return nil, fmt.Errorf("managed clone path exists but is not a git repository: %s", cloneDir)
 		}
-		git, gitErr := gitBinary()
-		if gitErr != nil {
-			return nil, gitErr
-		}
-		result, runErr := runCmd(ctx, git, []string{"clone", httpsURL, cloneDir}, CmdOptions{
-			Cwd:     reposDir(),
-			Env:     env,
-			Timeout: 15 * time.Minute,
-		})
+		// The clone can run for 15 minutes; use the same live token and auth
+		// retry as every other daemon git operation instead of a startup
+		// snapshot.
+		result, runErr := gitWithAuthRetry(ctx, reposDir(), local.gitEnvWithToken, local.refreshToken, 15*time.Minute, false,
+			"clone", httpsURL, cloneDir)
 		if runErr != nil {
 			return nil, fmt.Errorf("clone %s: %w (%s)", repo.FullName, runErr, tailString(result.Stderr, 10))
 		}
@@ -80,40 +163,21 @@ func resolveRepo(ctx context.Context, repo RepoConfig, info RepoInfo, identity U
 		}
 		_, _ = runCmd(ctx, git, []string{"remote", "set-url", "origin", httpsURL}, CmdOptions{
 			Cwd:          cloneDir,
-			Env:          env,
+			Env:          local.gitEnv(),
 			Timeout:      30 * time.Second,
 			AllowFailure: true,
 		})
 	}
 
-	worktreeRoot := repo.WorktreeRoot
-	if worktreeRoot == "" {
-		worktreeRoot = filepath.Join(treesDir(), repo.Owner+"-"+repo.Name)
-	}
 	if err := os.MkdirAll(worktreeRoot, 0o755); err != nil {
 		return nil, err
 	}
 
-	return &LocalRepo{
-		Dir:          cloneDir,
-		HTTPSURL:     httpsURL,
-		Base:         info.DefaultBranch,
-		WorktreeRoot: worktreeRoot,
-		Env:          env,
-	}, nil
+	return local, nil
 }
 
 func gitRun(ctx context.Context, local *LocalRepo, timeout time.Duration, allowFailure bool, args ...string) (CmdResult, error) {
-	git, err := gitBinary()
-	if err != nil {
-		return CmdResult{}, err
-	}
-	return runCmd(ctx, git, args, CmdOptions{
-		Cwd:          local.Dir,
-		Env:          local.Env,
-		Timeout:      timeout,
-		AllowFailure: allowFailure,
-	})
+	return gitWithAuthRetry(ctx, local.Dir, local.gitEnvWithToken, local.refreshToken, timeout, allowFailure, args...)
 }
 
 func fetchBase(ctx context.Context, local *LocalRepo) error {
@@ -277,15 +341,15 @@ func gitOutput(ctx context.Context, dir string, env []string, timeout time.Durat
 }
 
 func logSinceBase(ctx context.Context, dir string, local *LocalRepo) string {
-	return gitOutput(ctx, dir, local.Env, time.Minute, "log", "--oneline", "origin/"+local.Base+"..HEAD")
+	return gitOutput(ctx, dir, local.gitEnv(), time.Minute, "log", "--oneline", "origin/"+local.Base+"..HEAD")
 }
 
 func diffStat(ctx context.Context, dir string, local *LocalRepo) string {
-	return gitOutput(ctx, dir, local.Env, time.Minute, "diff", "--stat", "origin/"+local.Base+"...HEAD")
+	return gitOutput(ctx, dir, local.gitEnv(), time.Minute, "diff", "--stat", "origin/"+local.Base+"...HEAD")
 }
 
 func changedFiles(ctx context.Context, dir string, local *LocalRepo) []string {
-	output := gitOutput(ctx, dir, local.Env, time.Minute, "diff", "--name-only", "origin/"+local.Base+"...HEAD")
+	output := gitOutput(ctx, dir, local.gitEnv(), time.Minute, "diff", "--name-only", "origin/"+local.Base+"...HEAD")
 	if output == "" {
 		return nil
 	}
@@ -300,7 +364,7 @@ func changedFiles(ctx context.Context, dir string, local *LocalRepo) []string {
 }
 
 func pushBranch(ctx context.Context, dir string, local *LocalRepo, branch string) error {
-	return pushBranchTo(ctx, dir, local.HTTPSURL, local.Env, branch, branch)
+	return pushBranchTo(ctx, dir, local.HTTPSURL, local.gitEnvWithToken, local.refreshToken, branch, branch)
 }
 
 // syncWorktreeBranch fast-forwards a worktree to its branch head before it
@@ -308,10 +372,11 @@ func pushBranch(ctx context.Context, dir string, local *LocalRepo, branch string
 // the same branch, so a worktree created earlier can be behind and its push
 // would be rejected as a non-fast-forward. Nothing else rewrites these branches,
 // so a fast-forward is enough and a diverged history is reported instead of
-// force-pushed.
-func syncWorktreeBranch(ctx context.Context, dir, remoteURL string, env []string, branch string) error {
+// force-pushed. The fetch goes through gitWithAuthRetry so it follows the live
+// token like every other daemon git operation.
+func syncWorktreeBranch(ctx context.Context, dir, remoteURL string, env func() ([]string, string), rotate func(context.Context, string) bool, branch string) error {
 	remoteRef := "refs/remotes/origin/" + branch
-	result, err := gitWorktree(ctx, dir, env, 5*time.Minute, true,
+	result, err := gitWithAuthRetry(ctx, dir, env, rotate, 5*time.Minute, true,
 		"fetch", remoteURL, fmt.Sprintf("+refs/heads/%s:%s", branch, remoteRef))
 	if err != nil {
 		return err
@@ -321,10 +386,11 @@ func syncWorktreeBranch(ctx context.Context, dir, remoteURL string, env []string
 	if result.Code != 0 {
 		return nil
 	}
-	if gitOutput(ctx, dir, env, time.Minute, "rev-parse", "--verify", remoteRef) == "" {
+	currentEnv, _ := env()
+	if gitOutput(ctx, dir, currentEnv, time.Minute, "rev-parse", "--verify", remoteRef) == "" {
 		return nil
 	}
-	merge, err := gitWorktree(ctx, dir, env, 2*time.Minute, true, "merge", "--ff-only", remoteRef)
+	merge, err := gitWorktree(ctx, dir, currentEnv, 2*time.Minute, true, "merge", "--ff-only", remoteRef)
 	if err != nil {
 		return err
 	}
@@ -338,16 +404,8 @@ func syncWorktreeBranch(ctx context.Context, dir, remoteURL string, env []string
 // pushBranchTo pushes a local branch to an explicit remote ref. The remote may
 // be another repository: a pull request head that lives in a fork the author
 // opened for maintainers, where local and remote branch names differ.
-func pushBranchTo(ctx context.Context, dir, remoteURL string, env []string, localBranch, remoteBranch string) error {
-	git, err := gitBinary()
-	if err != nil {
-		return err
-	}
-	_, err = runCmd(ctx, git, []string{"push", remoteURL, localBranch + ":" + remoteBranch}, CmdOptions{
-		Cwd:     dir,
-		Env:     env,
-		Timeout: 10 * time.Minute,
-	})
+func pushBranchTo(ctx context.Context, dir, remoteURL string, env func() ([]string, string), rotate func(context.Context, string) bool, localBranch, remoteBranch string) error {
+	_, err := gitWithAuthRetry(ctx, dir, env, rotate, 10*time.Minute, false, "push", remoteURL, localBranch+":"+remoteBranch)
 	return err
 }
 

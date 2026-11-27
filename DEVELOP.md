@@ -106,9 +106,10 @@ Only the daemon writes `state.json`; the web UI and CLIs read it. Treat
 4. `NewGH`: resolves the credential in `GH_AGENT_TOKEN` → `~/.issuekiller/token`
    → the old `gh-agent` `hosts.yml` (read-only compatibility), refreshes it when
    it is close to expiry, and verifies the identity (never the human account).
-5. For each repo: `GetRepo`, `resolveRepo` (managed clone under `repos/`),
-   `EnsureLabels`, build the child env (proxy + `GH_TOKEN`/`GITHUB_TOKEN` so the
-   agent's own `gh` calls use the bot).
+5. For each repo: `GetRepo`, `resolveRepo` (managed clone under `repos/`) with a
+   live token factory (`GH.currentToken`) and the refresh hook, then
+   `EnsureLabels`. No child environment is built at startup: `AppContext.Env()`
+   rebuilds it (proxy + live `GH_TOKEN`/`GITHUB_TOKEN`) on every use.
 6. `LoadStore`, `NewRouter` (queues + worker goroutines), optional web server.
 7. `router.StartupScan`: resumes interrupted work, applies pending closes,
    and picks up issues that already mention the agent.
@@ -597,8 +598,22 @@ fallback; both funnel into `Router.Handle*`.
   branch `agent/issue-<n>-<short id>`; removed with `--force` after merge or
   cancel.
 - Commits use the bot identity (`<id>+<login>@users.noreply.github.com`).
-- Push uses a one-shot `http.extraheader` with the token, built into
-  `LocalRepo.Env`; nothing is written to any gitconfig.
+- Pushes use a one-shot `http.extraheader` with the live token, rebuilt for each
+  git operation and for each child process when it is started, so a rotated token
+  reaches the next daemon git command; nothing is written to any gitconfig. A
+  child process keeps the snapshot it was started with: an agent whose `gh` or
+  `git push` outlives a rotation still sees the old token (implement runs can
+  last `ImplementTimeout`), and only the daemon's own git operations follow the
+  rotation. Each authenticated git command captures the token embedded in its
+  first environment and passes that exact value to `GH.refreshAfterUnauthorized`
+  on a 401, avoiding a redundant refresh when another goroutine already rotated
+  it. If refresh errors after a concurrent rotation, the command still retries
+  once with the live token. The worktree-ahead check retries its branch fetch on
+  auth failure, treats only `merge-base --is-ancestor` exit 1 as “not ahead”,
+  and reports any other check or publish failure instead of gating the stale PR
+  head. The initial managed clone uses the same live environment and retry, as
+  does the `followMaster` watcher (§16), whose `ls-remote`, clone and fetch also
+  follow a rotation.
 - `plan` uses a temporary detached worktree under `tmp/`.
 - `syncWorktreeBranch` fast-forwards an issue worktree to its branch head right
   before a revision edits it, because a review fix can have pushed to the same
@@ -857,10 +872,17 @@ poll and a 500 ms debounce; invalid edits are ignored with a warning.
 `watchMaster` (`followMaster: true`) is the development counterpart of release
 updates: it polls `master` every 30 s, rebuilds in a dedicated clone under
 `$STATE/self` (frontend build included, `npm ci` only when the lockfile moves)
-and fires a restart; it takes precedence over `selfUpdate`. The watch baseline
-is the injected `main.commit`, not the remote head: a restart queued behind a
-long job re-execs whichever binary was built earlier, and seeding from the head
-would silently leave it one commit behind until the next push. The
+and fires a restart; it takes precedence over `selfUpdate`. It receives the
+environment factory `AppContext.envWithToken` and its refresh hook rather than
+one startup slice, so the `ls-remote` poll and the clone/fetch steps of a
+rebuild retry a rotated bot token like job git operations do. A failed first
+poll (an expired token at that instant, a proxy
+hiccup) does not disable the watcher: it warns once and retries on the next
+tick, so one bad read cannot switch `followMaster` off for the daemon's
+lifetime. The watch baseline is the injected `main.commit`, not the remote head:
+a restart queued behind a long job re-execs whichever binary was built earlier,
+and seeding from the head would silently leave it one commit behind until the
+next push. The
 dashboard's PUT reuses the same loader and triggers the same reload, as do
 `/api/restart` and a finished update. Both end in `reexec`, so the pid and the
 lock stay valid; interrupted implementations resume from their worktree on the
@@ -909,8 +931,9 @@ keeps tests quiet. Notable coverage:
 | file | covers |
 | --- | --- |
 | `waitforchecks_test.go` | verdict, fail-fast, stuck, required checks, base flags, approval, log report |
+| `git_test.go` | push to a differently named remote ref, git environment follows token rotation, git-first 401 rotates and retries once (including the initial clone), non-auth failures do not, worktree branch sync fast-forwards or reports divergence |
 | `conflict_test.go` | conflict detection, merge-API error classification, `conflictedFiles` on a real repo |
-| `cirepair_test.go` | worktree-ahead detection used to publish a stranded repair commit |
+| `cirepair_test.go` | worktree-ahead detection used to publish a stranded repair commit, including fetch and merge-base failures instead of “not ahead” |
 | `review_test.go` | review command parsing, `review.json` loading, inline filtering, fallback body, review API payload, the auto-review gate (draft/self/same head/opted-out repo), the `pull_request` webhook delivery |
 | `modifypr_test.go` | which PR heads can be pushed (same repo, fork with allow-edits-by-maintainers) |
 | `comment_edit_test.go` | edited comments are reprocessed, plain repeats stay deduped |
@@ -938,7 +961,7 @@ keeps tests quiet. Notable coverage:
 | `webconfig_test.go` | `/api/config` validation/round-trip/origin check, `release` defaults and rejection, `/api/detect` degradation, `/api/update` payload, snapshot without a router |
 | `webprojects_test.go` | `/api/projects` role payload and access URL, add verifies GitHub first and leaves the file untouched on failure, remove keeps the other repos and their overrides, all three `repos` shapes, origin check |
 | `router_prlock_test.go` | one work job per PR at a time across the issue and PR keys, CI jobs skip the PR lock, key parsing |
-| `selfupdate_test.go` | version ordering, asset selection, mirror/digest parsing, archive extraction, checksum mismatch keeps the binary |
+| `selfupdate_test.go` | version ordering, asset selection, mirror/digest parsing, archive extraction, checksum mismatch keeps the binary, `followMaster` keeps polling after a failed first read and retries the head read after a token rotation |
 | `wizard_test.go` | `-init` setup wizard flows |
 | `logs_test.go`, `logging_test.go` | log rotation, follower, daemonize helpers |
 

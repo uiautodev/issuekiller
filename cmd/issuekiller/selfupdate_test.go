@@ -15,7 +15,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestCompareVersions(t *testing.T) {
@@ -327,5 +329,88 @@ func TestMasterWatchBaselineUsesBuildCommit(t *testing.T) {
 		if got := masterWatchBaseline(c.head, c.build); got != c.want {
 			t.Fatalf("masterWatchBaseline(%q, %q) = %q, want %q", c.head, c.build, got, c.want)
 		}
+	}
+}
+
+// A transient failure of the first ls-remote (an expired token at that instant,
+// a proxy hiccup) must not disable followMaster for the daemon's lifetime: the
+// watcher keeps polling and starts watching once a head arrives.
+func TestWatchMasterRetriesAfterFailedFirstRead(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var mu sync.Mutex
+	heads := []string{"", "", "aaa", "bbb"}
+	reads := 0
+	head := func(context.Context, func() ([]string, string), func(context.Context, string) bool) string {
+		mu.Lock()
+		defer mu.Unlock()
+		value := heads[len(heads)-1]
+		if reads < len(heads) {
+			value = heads[reads]
+			reads++
+		}
+		return value
+	}
+	rebuilt := make(chan string, 1)
+	rebuild := func(_ context.Context, _ *Logger, _ func() ([]string, string), _ func(context.Context, string) bool, head string) error {
+		rebuilt <- head
+		return nil
+	}
+
+	ready := watchMasterLoop(ctx, NewSilentLogger(), func() ([]string, string) { return nil, "" }, nil, time.Millisecond, 0, head, rebuild)
+
+	select {
+	case <-ready:
+	case <-time.After(5 * time.Second):
+		mu.Lock()
+		n := reads
+		mu.Unlock()
+		t.Fatalf("watcher did not rebuild after a failed first read (reads=%d)", n)
+	}
+	select {
+	case got := <-rebuilt:
+		if got != "bbb" {
+			t.Fatalf("rebuilt %q, want bbb", got)
+		}
+	default:
+		t.Fatal("ready fired without a rebuild")
+	}
+}
+
+// The followMaster head read and the authenticated steps of a rebuild must
+// retry a token that expired between polls, otherwise that master commit stays
+// unbuilt until the next push moves the branch again.
+func TestRemoteMasterHeadRetriesAfterTokenRotation(t *testing.T) {
+	bin := t.TempDir()
+	script := "#!/bin/sh\n" +
+		"if [ \"$TOKEN\" = gho_first ]; then\n" +
+		"  echo 'fatal: Authentication failed' >&2\n" +
+		"  exit 128\n" +
+		"fi\n" +
+		"echo 'aaaabbbb refs/heads/master'\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	token := "gho_first"
+	env := func() ([]string, string) {
+		return mergeEnv(os.Environ(), map[string]string{"TOKEN": token}), token
+	}
+	rotations := 0
+	rotate := func(_ context.Context, failed string) bool {
+		rotations++
+		if failed != "gho_first" {
+			t.Fatalf("failed token = %q, want gho_first", failed)
+		}
+		token = "gho_second"
+		return true
+	}
+	if got := remoteMasterHead(context.Background(), env, rotate); got != "aaaabbbb" {
+		t.Fatalf("remoteMasterHead = %q, want aaaabbbb after the rotation retry", got)
+	}
+	if rotations != 1 {
+		t.Fatalf("rotations = %d, want 1", rotations)
 	}
 }
