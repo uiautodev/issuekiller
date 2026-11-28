@@ -648,10 +648,11 @@ func (w *webServer) snapshot() webSnapshot {
 }
 
 // phaseNeedsUser reports whether a task is waiting for the approver: a plan to
-// approve, a merge/feedback decision, or a blocked task to unblock.
+// approve, a merge/feedback decision, a blocked task to unblock, or a PR the
+// security scan flagged.
 func phaseNeedsUser(phase string) bool {
 	switch phase {
-	case "awaiting_approval", "pr_open", "blocked":
+	case "awaiting_approval", "pr_open", "blocked", "reviewflagged":
 		return true
 	}
 	return false
@@ -666,7 +667,7 @@ func sortTasks(tasks []webTask) {
 			return 1
 		case task.Phase == "awaiting_approval":
 			return 2
-		case task.Phase == "blocked":
+		case task.Phase == "blocked", task.Phase == "reviewflagged":
 			return 3
 		case task.Phase == "pr_open":
 			return 4
@@ -712,6 +713,8 @@ func phaseLabel(phase string) string {
 		return "已审查"
 	case "reviewfailed":
 		return "审查失败"
+	case "reviewflagged":
+		return "安全风险"
 	}
 	return phase
 }

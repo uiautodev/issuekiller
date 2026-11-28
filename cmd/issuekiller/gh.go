@@ -520,16 +520,20 @@ func (g *GH) ReactReviewComment(ctx context.Context, fullName string, commentID 
 	return g.do(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/pulls/comments/%d/reactions", fullName, commentID), map[string]string{"content": content}, nil)
 }
 
-// The daemon manages exactly two lifecycle labels: one while the flow waits
-// for the user, one while the agent works. They are mutually exclusive.
+// The daemon manages two lifecycle labels, one while the flow waits for the
+// user and one while the agent works, and one standalone security label. The
+// lifecycle labels are mutually exclusive; agent:security-risk survives them
+// until a re-review comes back clean or a human removes it.
 const (
 	awaitingLabel = "agent:awaiting-approval"
 	workingLabel  = "agent:working"
+	securityLabel = "agent:security-risk"
 )
 
 var agentLabelSpecs = [][3]string{
 	{awaitingLabel, "fbca04", "waiting for user confirmation"},
 	{workingLabel, "1d76db", "the agent is working, no action needed"},
+	{securityLabel, "b60205", "blocked by the security scan; a maintainer must confirm"},
 }
 
 func (g *GH) EnsureLabels(ctx context.Context, fullName string) {
@@ -594,6 +598,18 @@ func (g *GH) setAgentStateUnconditional(ctx context.Context, fullName string, nu
 		return
 	}
 	_ = g.do(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/issues/%d/labels", fullName, number), map[string][]string{"labels": {label}}, nil)
+}
+
+// SetSecurityRiskLabel adds or removes the security label. The label is not a
+// lifecycle state: it stays until the review clears it, so an unrelated
+// agent:working/awaiting transition never hides a flagged PR.
+func (g *GH) SetSecurityRiskLabel(ctx context.Context, fullName string, number int, flagged bool) {
+	if flagged {
+		_ = g.do(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/issues/%d/labels", fullName, number),
+			map[string][]string{"labels": {securityLabel}}, nil)
+		return
+	}
+	_ = g.do(ctx, http.MethodDelete, fmt.Sprintf("/repos/%s/issues/%d/labels/%s", fullName, number, url.PathEscape(securityLabel)), nil, nil)
 }
 
 func (g *GH) CreatePR(ctx context.Context, fullName, title, head, base, body string) (PullRequest, error) {

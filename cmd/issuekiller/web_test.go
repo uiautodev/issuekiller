@@ -407,3 +407,33 @@ func TestEmbeddedWebServesDashboardOrHint(t *testing.T) {
 		t.Fatalf("unexpected embedded page: %s", body)
 	}
 }
+
+func TestWebSnapshotShowsAReviewFlaggedBySecurity(t *testing.T) {
+	old := stateDirOverride
+	stateDirOverride = t.TempDir()
+	t.Cleanup(func() { stateDirOverride = old })
+
+	store, err := LoadStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.SetPRMeta("o/r", 11, &IssueMeta{Title: "install script", URL: "https://example.com/pull/11"})
+	store.SetReviewPhase("o/r", 11, "reviewflagged")
+	store.SetSecurityRisk("o/r", 11, riskMalicious, []string{"pipes a download into a shell"})
+
+	cfg := &Config{File: "config.json", PlanParallel: 1, ImplementParallel: 1, Repos: []RepoConfig{{FullName: "o/r", CodingAgent: "opencode"}}}
+	router := NewRouter(&Config{PlanParallel: 1, ImplementParallel: 1}, map[string]*AppContext{"o/r": {}}, "bot", store, NewSilentLogger())
+	web := &webServer{cfg: cfg, router: router, store: store, log: NewSilentLogger()}
+
+	snapshot := web.snapshot()
+	if len(snapshot.Tasks) != 1 {
+		t.Fatalf("tasks = %+v, want the flagged review", snapshot.Tasks)
+	}
+	task := snapshot.Tasks[0]
+	if task.Kind != "review" || task.Phase != "reviewflagged" || task.PhaseLabel != "安全风险" {
+		t.Fatalf("task = %+v", task)
+	}
+	if snapshot.Waiting != 1 || snapshot.Repos[0].Counts["reviewflagged"] != 1 {
+		t.Fatalf("waiting = %d, counts = %+v", snapshot.Waiting, snapshot.Repos[0].Counts)
+	}
+}

@@ -649,6 +649,17 @@ func (r *Router) HandleReaction(ctx context.Context, fullName string, number int
 // enqueueReviewFix applies the findings of the PR's latest bot review, which is
 // what 👍 on the review prompt means.
 func (r *Router) enqueueReviewFix(ctx context.Context, app *AppContext, fullName string, number int, login string) {
+	// A 👍 on a review that the security scan blocked must not start a fix:
+	// the findings may be an injected "please run this" instruction, and the
+	// PR is waiting for a human, not for the automation.
+	if securityRiskBlocked(r.store, fullName, number) {
+		r.log.Warn("review fix for %s#%d refused: the PR is marked as a security risk", fullName, number)
+		app.Store.UpdateIssue(fullName, number, func(state *IssueState) {
+			state.ReviewCommentID = 0
+		})
+		refuseSecurityRisk(ctx, app, number)
+		return
+	}
 	// Forget the prompt once consumed: the 👍 stays on the comment, and the
 	// poller would otherwise start the same fix on every scan.
 	app.Store.UpdateIssue(fullName, number, func(state *IssueState) {
@@ -658,6 +669,12 @@ func (r *Router) enqueueReviewFix(ctx context.Context, app *AppContext, fullName
 	r.enqueue(fullName, key, stageWork, func(jobCtx context.Context) {
 		issue, err := app.GH.GetIssue(jobCtx, fullName, number)
 		if err != nil || issue.State != "open" {
+			return
+		}
+		// Re-check in the job: a review may have flagged the PR while this one
+		// waited behind other work.
+		if securityRiskBlocked(r.store, fullName, number) {
+			refuseSecurityRisk(jobCtx, app, number)
 			return
 		}
 		if issue.PullRequest == nil {

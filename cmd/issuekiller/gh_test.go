@@ -156,8 +156,8 @@ func TestEnsureLabelsCreatesLifecycleLabels(t *testing.T) {
 	gh.EnsureLabels(context.Background(), "acme/app")
 
 	got := calls.snapshot()
-	if len(got) != 4 {
-		t.Fatalf("calls = %+v, want GET+POST for two labels", got)
+	if len(got) != 6 {
+		t.Fatalf("calls = %+v, want GET+POST for three labels", got)
 	}
 	names := map[string]string{}
 	for _, call := range got {
@@ -173,7 +173,7 @@ func TestEnsureLabelsCreatesLifecycleLabels(t *testing.T) {
 		}
 		names[payload.Name] = payload.Color
 	}
-	if names[awaitingLabel] != "fbca04" || names[workingLabel] != "1d76db" {
+	if names[awaitingLabel] != "fbca04" || names[workingLabel] != "1d76db" || names[securityLabel] != "b60205" {
 		t.Fatalf("created labels = %+v", names)
 	}
 }

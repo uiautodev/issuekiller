@@ -183,6 +183,14 @@ go build -o bin/issuekiller ./cmd/issuekiller
 显示在看板上（审查中 / 已审查 / 审查失败），带 PR 标题和链接，与 issue 任务并列；
 已结束的 review 跟随「隐藏已结束」开关。
 
+每次 review 都会在 agent 启动前对 diff 做一遍确定性安全扫描。干净的 PR 照常
+review、照常跑项目测试；命中规则的 diff 完全不会被执行，review 直接用静态结论
+生成，PR 自带的测试和脚本都不会跑。命中「恶意」项（读取凭证或 `~/.issuekiller`、
+把下载内容管道给 shell、新增安装钩子、提升 CI 权限或改动 agent 自己的 prompt）
+会被标记 `agent:security-risk`，review 里带风险提示，看板上单独显示为「安全风险」；
+这类 PR 的自动修复和自动合并一律拒绝，直到维护者确认安全、删掉标签并重新 review。
+只是可疑但不致命的命中只会加一条警告横幅，正常的 👍 流程继续。
+
 每个被接受的 👍 都会立刻收到一个 👀 回应，任务还在排队或执行时也能看到已经收到。
 
 命令必须来自 approver、@ 了 agent。解析时会忽略引用行，因此引用回复末尾

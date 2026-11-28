@@ -225,6 +225,17 @@ command sets `"autoReview": false`; a failed review is retried by a new push or
 tasks (reviewing / reviewed / failed) with the PR title and link, next to the
 issue tasks; finished reviews follow the hide-finished toggle.
 
+Every review also runs a deterministic security scan on the diff before the
+agent starts. A clean PR keeps the normal review and the project's tests. A diff
+that matches a rule is not executed at all: the review is built statically, so
+the PR's tests and scripts never run. A malicious match (reading credentials or
+`~/.issuekiller`, piping a download into a shell, install hooks, CI permission
+escalation, edits to the agent's own prompts) gets the `agent:security-risk`
+label, a warning in the review and a dedicated dashboard row (**Security
+risk**); its automatic fix and merge are refused until a maintainer clears the
+label and re-reviews it. A suspicious-but-not-decisive match only adds a
+warning banner and the normal 👍 flow continues.
+
 Every accepted 👍 gets an 👀 reaction immediately, so you can see the daemon
 picked it up while the work is still running.
 
