@@ -706,6 +706,9 @@ type reviewResult struct {
 	Verdict  string          `json:"verdict"`
 	Summary  string          `json:"summary"`
 	Findings []reviewFinding `json:"comments"`
+	// Security is the agent's independent risk assessment. The deterministic
+	// scan is merged into it before the review is posted.
+	Security *securityScan `json:"security,omitempty"`
 }
 
 func runDirForPR(app *AppContext, prNumber int) string {
@@ -725,10 +728,15 @@ func doReviewPR(ctx context.Context, app *AppContext, trigger Trigger, pr PullRe
 	if app.Store != nil {
 		app.Store.SetReviewPhase(app.Repo.FullName, number, "reviewing")
 		// Every return before the success marker is a failed review: keep it on
-		// the board instead of leaving the row stuck in "reviewing".
+		// the board instead of leaving the row stuck in "reviewing". A PR that
+		// was already flagged stays flagged even when this run fails.
 		defer func() {
 			if !succeeded {
-				app.Store.SetReviewPhase(app.Repo.FullName, number, "reviewfailed")
+				phase := "reviewfailed"
+				if securityRiskBlocked(app.Store, app.Repo.FullName, number) {
+					phase = "reviewflagged"
+				}
+				app.Store.SetReviewPhase(app.Repo.FullName, number, phase)
 			}
 		}()
 	}
@@ -751,44 +759,59 @@ func doReviewPR(ctx context.Context, app *AppContext, trigger Trigger, pr PullRe
 	}
 	defer removeWorktree(ctx, app.Local, worktree, true)
 
-	runner, err := newCodingRunner(app.Repo.CodingAgent)
-	if err != nil {
-		postReviewFailure(ctx, app, number, err)
-		return
+	// Scan before anything from the PR can execute. A hit skips the agent (and
+	// therefore the project's tests) entirely; a clean diff keeps the normal
+	// review with its tests, so ordinary PRs are still verified dynamically.
+	scan := scanPullRequest(ctx, app, worktree, number)
+	var review reviewResult
+	if normalizeRisk(scan.Risk) != riskNone {
+		app.Log.Warn("review %s#%d: security scan flagged %s; skipping agent execution", app.Repo.FullName, number, scan.Risk)
+		review = staticSecurityReview(app, number, scan)
+	} else {
+		runner, err := newCodingRunner(app.Repo.CodingAgent)
+		if err != nil {
+			postReviewFailure(ctx, app, number, err)
+			return
+		}
+		prompt, err := renderPrompt("review", map[string]string{
+			"REPO":     app.Repo.FullName,
+			"PR":       fmt.Sprintf("#%d %s", number, pr.HTMLURL),
+			"NUMBER":   itoa(number),
+			"TITLE":    pr.Title,
+			"AUTHOR":   firstNonEmpty(pr.User.Login, "unknown"),
+			"BODY":     firstNonEmpty(pr.Body, "(no description)"),
+			"BASE":     app.Local.Base,
+			"BRANCH":   pr.Head.Ref,
+			"WORKTREE": worktree,
+			"RUN_DIR":  runDir,
+			"LANGUAGE": promptLanguage(app),
+		})
+		if err != nil {
+			postReviewFailure(ctx, app, number, err)
+			return
+		}
+		result, err := runner.Run(ctx, RunnerOptions{
+			Cwd:     worktree,
+			Prompt:  prompt,
+			Model:   app.Repo.Model,
+			RunDir:  runDir,
+			Env:     app.Env(),
+			Timeout: app.Cfg.PlanTimeout,
+			LogFile: filepath.Join(runDir, fmt.Sprintf("review-%s.log", app.Repo.CodingAgent)),
+			Log:     app.Log,
+		})
+		if err != nil {
+			postReviewFailure(ctx, app, number, fmt.Errorf("review agent: %w", err))
+			return
+		}
+		review = loadReviewResult(runDir, result.Text)
+		merged := mergeSecurity(review.Security, scan)
+		review.Security = &merged
 	}
-	prompt, err := renderPrompt("review", map[string]string{
-		"REPO":     app.Repo.FullName,
-		"PR":       fmt.Sprintf("#%d %s", number, pr.HTMLURL),
-		"NUMBER":   itoa(number),
-		"TITLE":    pr.Title,
-		"AUTHOR":   firstNonEmpty(pr.User.Login, "unknown"),
-		"BODY":     firstNonEmpty(pr.Body, "(no description)"),
-		"BASE":     app.Local.Base,
-		"BRANCH":   pr.Head.Ref,
-		"WORKTREE": worktree,
-		"RUN_DIR":  runDir,
-		"LANGUAGE": promptLanguage(app),
-	})
-	if err != nil {
-		postReviewFailure(ctx, app, number, err)
-		return
+	security := review.Security
+	if security == nil {
+		security = &securityScan{Risk: riskNone}
 	}
-	result, err := runner.Run(ctx, RunnerOptions{
-		Cwd:     worktree,
-		Prompt:  prompt,
-		Model:   app.Repo.Model,
-		RunDir:  runDir,
-		Env:     app.Env(),
-		Timeout: app.Cfg.PlanTimeout,
-		LogFile: filepath.Join(runDir, fmt.Sprintf("review-%s.log", app.Repo.CodingAgent)),
-		Log:     app.Log,
-	})
-	if err != nil {
-		postReviewFailure(ctx, app, number, fmt.Errorf("review agent: %w", err))
-		return
-	}
-
-	review := loadReviewResult(runDir, result.Text)
 	body := renderReviewBody(app, number, review)
 
 	allowed := map[string]map[int]bool(nil)
@@ -816,7 +839,34 @@ func doReviewPR(ctx context.Context, app *AppContext, trigger Trigger, pr PullRe
 		posted = created
 		app.Log.Info("review posted for %s#%d", app.Repo.FullName, number)
 	}
-	recordReviewedPR(ctx, app, number, posted.ID)
+
+	if normalizeRisk(security.Risk) == riskMalicious {
+		// A malicious PR gets no 👍-to-apply prompt: the fix and merge paths
+		// refuse it too, and the label is the visible block on the PR.
+		recordReviewedPR(ctx, app, number, posted.ID, false)
+		app.Store.SetSecurityRisk(app.Repo.FullName, number, riskMalicious, security.Reasons)
+		app.Store.SetReviewPhase(app.Repo.FullName, number, "reviewflagged")
+		// Do not leave an awaiting-approval label behind: it invites a 👍 that
+		// the fix and merge paths will only refuse.
+		app.GH.SetAgentState(ctx, app.Repo.FullName, number, "")
+		app.GH.SetSecurityRiskLabel(ctx, app.Repo.FullName, number, true)
+		postSecurityAlert(ctx, app, number, *security)
+		app.Store.SetReviewedSHA(app.Repo.FullName, number, pr.Head.SHA)
+		succeeded = true
+		return
+	}
+	previous := app.Store.Issue(app.Repo.FullName, number).SecurityRisk
+	risk := normalizeRisk(security.Risk)
+	var reasons []string
+	if risk != riskNone {
+		reasons = security.Reasons
+	}
+	app.Store.SetSecurityRisk(app.Repo.FullName, number, risk, reasons)
+	if normalizeRisk(previous) == riskMalicious {
+		// The fix may have removed the risky code; do not leave a stale block.
+		app.GH.SetSecurityRiskLabel(ctx, app.Repo.FullName, number, false)
+	}
+	recordReviewedPR(ctx, app, number, posted.ID, true)
 	// The successful review covers this head; a failed run keeps the SHA
 	// recorded at enqueue time so the same head is not retried forever, and a
 	// manual `@bot review` remains the way to force a re-run.
@@ -829,18 +879,21 @@ func doReviewPR(ctx context.Context, app *AppContext, trigger Trigger, pr PullRe
 }
 
 // recordReviewedPR remembers the review a 👍 applies and posts the comment that
-// carries that thumbs-up (GitHub has no reactions on review bodies).
-func recordReviewedPR(ctx context.Context, app *AppContext, number int, reviewID int64) {
+// carries that thumbs-up (GitHub has no reactions on review bodies). A
+// security-blocked review passes askApply=false: it must not invite a 👍.
+func recordReviewedPR(ctx context.Context, app *AppContext, number int, reviewID int64, askApply bool) {
 	commentID := int64(0)
-	body := strings.Join([]string{
-		app.text(number, "review.posted.title"),
-		"",
-		app.text(number, "review.posted.hint"),
-	}, "\n")
-	if posted, err := app.GH.PostComment(ctx, app.Repo.FullName, number, body); err == nil {
-		commentID = posted.ID
-	} else {
-		app.Log.Warn("post review thumbs-up prompt for %s#%d: %v", app.Repo.FullName, number, err)
+	if askApply {
+		body := strings.Join([]string{
+			app.text(number, "review.posted.title"),
+			"",
+			app.text(number, "review.posted.hint"),
+		}, "\n")
+		if posted, err := app.GH.PostComment(ctx, app.Repo.FullName, number, body); err == nil {
+			commentID = posted.ID
+		} else {
+			app.Log.Warn("post review thumbs-up prompt for %s#%d: %v", app.Repo.FullName, number, err)
+		}
 	}
 	app.Store.UpdateIssue(app.Repo.FullName, number, func(state *IssueState) {
 		// UpdateIssue creates new entries in phase "new" for issues; a reviewed
@@ -904,8 +957,8 @@ func reviewInstructions(ctx context.Context, app *AppContext, pr PullRequest, re
 	return out.String(), nil
 }
 
-// reviewSummary strips the review wrapper (heading, verdict badge and footer)
-// so only the reviewer's text is handed to the agent.
+// reviewSummary strips the review wrapper (heading, verdict badge, security
+// banner and footer) so only the reviewer's text is handed to the agent.
 func reviewSummary(body string) string {
 	lines := strings.Split(body, "\n")
 	kept := make([]string, 0, len(lines))
@@ -917,6 +970,8 @@ func reviewSummary(body string) string {
 		case strings.HasPrefix(trimmed, "**Verdict:**"):
 			continue
 		case strings.HasPrefix(trimmed, "🤖 Generated by"):
+			continue
+		case strings.HasPrefix(trimmed, "> 🛡️"):
 			continue
 		}
 		kept = append(kept, line)
@@ -944,15 +999,27 @@ func renderReviewBody(app *AppContext, number int, review reviewResult) string {
 	case "request_changes", "request changes", "request-changes", "changes_requested":
 		badge = "⚠️ request changes"
 	}
-	return strings.Join([]string{
-		"### 🤖 Review",
-		"",
+	lines := []string{"### 🤖 Review", ""}
+	if review.Security != nil && normalizeRisk(review.Security.Risk) != riskNone {
+		lines = append(lines, renderSecurityBanner(app, number, *review.Security), "")
+		if findings := formatSecurityFindings(review.Security.Findings, 8); findings != "" {
+			lines = append(lines, app.text(number, "security.rules_title"), "", findings, "")
+		}
+		if reasons := formatSecurityReasons(review.Security.Reasons, 5); reasons != "" {
+			lines = append(lines, app.text(number, "security.reasons_title"), "", reasons, "")
+		}
+		if normalizeRisk(review.Security.Risk) == riskMalicious {
+			badge = app.text(number, "security.verdict")
+		}
+	}
+	lines = append(lines,
 		firstNonEmpty(strings.TrimSpace(review.Summary), app.text(number, "review.empty_summary")),
 		"",
 		fmt.Sprintf("**Verdict:** %s", badge),
 		"",
 		fmt.Sprintf(app.text(number, "review.footer"), projectURL, app.AgentLogin),
-	}, "\n")
+	)
+	return strings.Join(lines, "\n")
 }
 
 // diffRightLines maps each changed file to the RIGHT-side line numbers a
@@ -1225,6 +1292,11 @@ func finishPRModify(ctx context.Context, app *AppContext, trigger Trigger, pr Pu
 // accepted the review is the approval, so a green head merges without a second
 // confirmation; a failing gate parks the PR on the approver instead.
 func mergeReviewedPR(ctx context.Context, app *AppContext, trigger Trigger, number int) {
+	if securityRiskBlocked(app.Store, app.Repo.FullName, number) {
+		app.Log.Warn("merge %s#%d refused: the review marked it as a security risk", app.Repo.FullName, number)
+		refuseSecurityRisk(ctx, app, number)
+		return
+	}
 	pr, err := app.GH.GetPR(ctx, app.Repo.FullName, number)
 	if err != nil {
 		app.Log.Warn("merge reviewed PR %s#%d: %v", app.Repo.FullName, number, err)
@@ -1243,6 +1315,13 @@ func mergeReviewedPR(ctx context.Context, app *AppContext, trigger Trigger, numb
 // for forks, because the resolution is pushed back to the head branch.
 func doMergePR(ctx context.Context, app *AppContext, trigger Trigger, pr PullRequest) {
 	number := pr.Number
+	if securityRiskBlocked(app.Store, app.Repo.FullName, number) {
+		// The security label is not a soft warning: an approver's merge command
+		// does not override it, only a fresh clean review does.
+		app.Log.Warn("pr merge %s#%d refused: the review marked it as a security risk", app.Repo.FullName, number)
+		refuseSecurityRisk(ctx, app, number)
+		return
+	}
 	rememberPRMeta(app, pr)
 	app.Log.Info("pr merge start for %s#%d", app.Repo.FullName, number)
 	// The merge job owns the PR label from here: green lands the PR, anything

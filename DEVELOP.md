@@ -154,6 +154,7 @@ dependencies.
 | `config.go` | config parsing, normalization, per-repo defaults |
 | `router.go` | event handling, commands, state machine, job scheduler (`plan`/`work`/`ci` queues), startup scan |
 | `actions.go` | the stages: plan, implement, revise, CI settle, merge, and their helpers |
+| `security.go` | deterministic diff scan for malicious PRs: risk levels, pattern/path rules, merging the agent's `security` verdict, refusal comments |
 | `checks.go` | `checks.json` detection/loading/execution and the summary line |
 | `gh.go` | GitHub REST client: issues, comments, PRs, labels, reviews, check runs, workflow runs/jobs, hooks, tags, commits, releases, asset uploads; token resolution and the 401 refresh retry |
 | `oauth.go` | built-in GitHub Device Flow, token file (`~/.issuekiller/token`, 0600), expiry/refresh, legacy `hosts.yml` reader |
@@ -192,10 +193,14 @@ dependencies.
 comment, also a 👍 target), `Checks`, `Screenshots`, `BlockedReason`,
 `ProcessedComments`/`ProcessedFeedback`, `MergedAt`/`CancelledAt`,
 `ReviewedSHA` (the PR head an automatic review already covered; a pull
-request tracked only for review keeps phase empty — it is not an issue) and
-`ReviewPhase` (`reviewing`/`reviewed`/`reviewfailed`). `ReviewPhase` is a
-separate axis: the board shows it as a review task while `Phase` stays empty,
-and it never enters the issue phase machine.
+request tracked only for review keeps phase empty — it is not an issue),
+`ReviewPhase` (`reviewing`/`reviewed`/`reviewfailed`/`reviewflagged`) and
+`SecurityRisk`/`SecurityReasons` (the stricter of the agent's and the
+deterministic scan's assessment). `ReviewPhase` is a separate axis: the board
+shows it as a review task while `Phase` stays empty, and it never enters the
+issue phase machine. `reviewflagged` is a review stopped by the security scan:
+the row stays visible (not part of the hide-finished set) and counts as waiting
+for the approver.
 
 | phase | meaning | who sets it |
 | --- | --- | --- |
@@ -209,13 +214,15 @@ and it never enters the issue phase machine.
 | `done` | squash-merged, issue closed, worktree removed | `doMerge` |
 | `cancelled` | issue closed by a human; PR closed, worktree removed | `HandleClosed` / `doCancel` |
 
-Lifecycle labels (`gh.go`) are exactly two and mutually exclusive:
+Lifecycle labels (`gh.go`) are two mutually exclusive states:
 `agent:awaiting-approval` when the flow waits for the user, `agent:working`
-while an agent runs. There is no separate blocked label. `SetAgentState` is
-idempotent: it reads the issue's labels and only deletes the stale lifecycle
-label and adds the wanted one, so re-applying the same state never shows up as
-add → remove → add in the issue timeline. A failed read falls back to the
-unconditional update so a stale label cannot survive a transient error.
+while an agent runs. `agent:security-risk` is separate: it is added when a
+review marks the PR malicious, survives lifecycle changes and is only removed
+by a clean re-review or a human. `SetAgentState` is idempotent: it reads the
+issue's labels and only deletes the stale lifecycle label and adds the wanted
+one, so re-applying the same state never shows up as add → remove → add in the
+issue timeline. A failed read falls back to the unconditional update so a stale
+label cannot survive a transient error.
 
 ## 6. Events, commands, feedback
 
@@ -272,7 +279,20 @@ Other rules:
   therefore reviews the current head of every open PR once. The review is a
   board task of its own: enqueue and the manual command set `ReviewPhase` to
   `reviewing`, success moves it to `reviewed`, a failed run to `reviewfailed`,
-  and the dashboard keeps the PR title and link from `SetPRMeta`.
+  a security stop to `reviewflagged`, and the dashboard keeps the PR title and
+  link from `SetPRMeta`.
+- **Security scan** runs before the review agent, on the checked-out diff
+  (`scanPullRequest` → `scanDiff`). Any hit skips the agent and its tests, so
+  a malicious PR never executes; a clean PR keeps the normal review and still
+  runs the project's tests. `malicious` findings (credential/state reads,
+  `curl | sh`, install hooks, CI `write-all`, prompt files) add
+  `agent:security-risk`, store `SecurityRisk`, move `ReviewPhase` to
+  `reviewflagged`, post a separate alert and stop every automatic fix or merge.
+  `suspicious` hits (large base64 blobs, paste/tunnel hosts, workflow or
+  `.gitattributes` changes, ci permission additions) only add a banner to the
+  review body; the normal 👍 flow continues. The agent's `security` block is
+  merged with the scan by taking the stricter level, so a prompt-injected
+  "approve" cannot clear a deterministic hit.
 - A non-command mention from an approver on a pull request the daemon does not
   own is a **modification request** (`doModifyPR`): edit the PR head, run the
   checks and push back to the head branch. Same-repository branches are pushed
@@ -314,7 +334,9 @@ Other rules:
   fix is pushed and the gate passes, `mergeReviewedPR` lands the PR without a
   second confirmation (`doMergePR`), and `finishMergedPR` clears the labels and
   marks a tracked issue that opened the PR as `done`. Closing the PR before the
-  merge lands stops it.
+  merge lands stops it. When `SecurityRisk` is `malicious`, `enqueueReviewFix`,
+  `mergeReviewedPR` and `doMergePR` refuse and reply with the security block
+  comment instead: a 👍 and an explicit merge command cannot override it.
 - Reaction events are not always delivered, so `checkReactions` (30 s poller)
   re-checks 👍 on the plan comment, the PR announcement, the review prompt and
   a blocked task's status comment; reviewed PRs are not in a task phase, so the
@@ -426,16 +448,25 @@ same CI settle.
 
 **Review** (`doReviewPR`) — read-only and independent of the issue flow. It
 fetches `refs/pull/<n>/head` (works for fork PRs), checks it out in a detached
-worktree, runs the agent with `review.md` and reads `review.json`
-(`verdict`, `summary`, `comments[]`), then posts a GitHub review
-(`POST /pulls/{n}/reviews`) with up to 10 inline comments. Findings that point
-at a file or line outside the diff cannot be attached inline (GitHub answers
-422 “Path could not be resolved”), so they are listed in the review body
-instead. It then posts a “Review 已提交” comment and stores its id plus the
-review id in the PR's `IssueState`, so a 👍 on that comment applies the
-findings through `doModifyPR`. On success it also records the reviewed head in
-`ReviewedSHA`, which is what deduplicates the automatic reviews. Nothing is
-ever pushed by the review itself and the worktree is removed afterwards.
+worktree and scans the diff before running anything: `scanDiff` matches added
+lines and changed paths against the deterministic rules in `security.go`.
+Any hit (`suspicious` or `malicious`) skips the agent entirely, so the PR's
+tests and scripts never run; the review is built statically from the findings.
+A clean diff runs the agent with `review.md` and reads `review.json`
+(`verdict`, `summary`, `security`, `comments[]`). The agent's `security`
+verdict and the deterministic scan are merged by taking the stricter level,
+then a GitHub review (`POST /pulls/{n}/reviews`) is posted with up to 10 inline
+comments. Findings that point at a file or line outside the diff cannot be
+attached inline (GitHub answers 422 “Path could not be resolved”), so they are
+listed in the review body instead. A malicious result adds the
+`agent:security-risk` label, stores `SecurityRisk`/`SecurityReasons`, sets
+`reviewflagged`, posts a separate alert and skips the “Review 已提交” 👍 prompt.
+Anything else posts that prompt and stores its id plus the review id in the
+PR's `IssueState`, so a 👍 applies the findings through `doModifyPR`; a clean
+re-review clears the old risk and label. On success it also records the
+reviewed head in `ReviewedSHA`, which is what deduplicates the automatic
+reviews. Nothing is ever pushed by the review itself and the worktree is
+removed afterwards.
 
 **Merge PR** (`doMergePR`) — lands a PR the daemon does not own: fetch the head
 into a branch worktree, resolve conflicts with `conflict_fix.md` (merge the base,
@@ -723,12 +754,14 @@ port, proxy, mirror, release interval or bump returns 400 and nothing is saved.
 `/api/open-url` accepts only absolute http(s) URLs and starts the platform
 helper (`open`/`xdg-open`/`rundll32`) without a shell. Queue depth in
 `/api/state` includes `plan`, `work` and `ci`. `waiting` counts tasks whose phase
-needs the approver (`awaiting_approval`, `pr_open`, `blocked`, see
-`phaseNeedsUser`); the board can be filtered by phase, by project (the repo
+needs the approver (`awaiting_approval`, `pr_open`, `blocked`, `reviewflagged`,
+see `phaseNeedsUser`); the board can be filtered by phase, by project (the repo
 dropdown) and by free text. Tasks have a `kind`: issue rows come from `Phase`,
-review rows from `ReviewPhase` (`reviewing`, `reviewed`, `reviewfailed`) and
-carry the PR title/link. Finished rows include `done`, `cancelled`, `reviewed`
-and `reviewfailed`, so the hide-finished toggle also clears review history.
+review rows from `ReviewPhase` (`reviewing`, `reviewed`, `reviewfailed`,
+`reviewflagged`) and carry the PR title/link. Finished rows include `done`,
+`cancelled`, `reviewed` and `reviewfailed`, so the hide-finished toggle also
+clears review history; a `reviewflagged` row is never hidden because it waits
+for a human decision.
 
 The page is a client-rendered SvelteKit SPA in `frontend/` (Svelte 5 runes,
 Tailwind v4, shadcn-svelte CSS tokens). `npm run build` writes it to
@@ -935,6 +968,7 @@ keeps tests quiet. Notable coverage:
 | `conflict_test.go` | conflict detection, merge-API error classification, `conflictedFiles` on a real repo |
 | `cirepair_test.go` | worktree-ahead detection used to publish a stranded repair commit, including fetch and merge-base failures instead of “not ahead” |
 | `review_test.go` | review command parsing, `review.json` loading, inline filtering, fallback body, review API payload, the auto-review gate (draft/self/same head/opted-out repo), the `pull_request` webhook delivery |
+| `security_test.go` | the deterministic diff scan (credential/state reads, `curl \| sh`, install hooks, workflow permissions, prompt files, deleted `AGENTS.md`), no false positive on a routine refactor or documentation/prose, model/scan severity merge, the static review, the banner in the review body, and the refusal of a flagged PR in `enqueueReviewFix`, `mergeReviewedPR` and `doMergePR` |
 | `modifypr_test.go` | which PR heads can be pushed (same repo, fork with allow-edits-by-maintainers) |
 | `comment_edit_test.go` | edited comments are reprocessed, plain repeats stay deduped |
 | `approve_phase_test.go` | 👍 and merge move the phase as soon as they are accepted |
@@ -1026,6 +1060,7 @@ green unit check does not cover the UI; skipping this step is not allowed.
 | issue routing (`mode`, auto triage, plan vs build) | §5, §8, §14 and DEPLOY.md §4.1 |
 | a command keyword, 👍 handling, lifecycle rules | §6 |
 | the PR review command, `review.md`, review posting | §6, §8 and §17 |
+| the PR security scan, risk levels, `security` field or `agent:security-risk` | §5, §6, §8, §11, §15 and §17 |
 | the PR modify flow, `modify_pr.md`, push-to-head rules | §6, §8 and §17 |
 | thumbs-up semantics (`ReviewCommentID`) | §6 and §8 |
 | queue stages, worker counts, job keys, cancel/wait rules | §7 |

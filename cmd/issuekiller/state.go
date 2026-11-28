@@ -59,8 +59,13 @@ type IssueState struct {
 	// ReviewPhase tracks a pull request's review separately from Phase: a
 	// reviewed PR is not an issue task and must keep its empty phase, but the
 	// dashboard still shows "reviewing"/"reviewed"/"reviewfailed" as its own
-	// row.
-	ReviewPhase     string        `json:"reviewPhase,omitempty"`
+	// row. "reviewflagged" means the security scan stopped the flow.
+	ReviewPhase string `json:"reviewPhase,omitempty"`
+	// SecurityRisk is the stricter of the agent's and the deterministic scan's
+	// assessment. A malicious PR is labelled and every automatic fix or merge
+	// is refused until a human clears it.
+	SecurityRisk    string        `json:"securityRisk,omitempty"`
+	SecurityReasons []string      `json:"securityReasons,omitempty"`
 	Checks          []CheckResult `json:"checks,omitempty"`
 	Screenshots     []Shot        `json:"screenshots,omitempty"`
 	BlockedReason   string        `json:"blockedReason,omitempty"`
@@ -243,6 +248,24 @@ func (s *Store) SetReviewPhase(fullName string, number int, phase string) {
 		repo.Issues[key] = issue
 	}
 	issue.ReviewPhase = phase
+	issue.UpdatedAt = nowISO()
+	_ = s.SaveLocked()
+}
+
+// SetSecurityRisk records the review's risk assessment without touching Phase,
+// like SetReviewPhase. An empty risk clears the record after a clean re-review.
+func (s *Store) SetSecurityRisk(fullName string, number int, risk string, reasons []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	repo := s.repoLocked(fullName)
+	key := itoa(number)
+	issue := repo.Issues[key]
+	if issue == nil {
+		issue = &IssueState{Phase: "", CreatedAt: nowISO()}
+		repo.Issues[key] = issue
+	}
+	issue.SecurityRisk = risk
+	issue.SecurityReasons = reasons
 	issue.UpdatedAt = nowISO()
 	_ = s.SaveLocked()
 }

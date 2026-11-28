@@ -310,6 +310,17 @@ watched repository (no stored poll timestamp yet) counts every open PR as
 updated and reviews each current head once; afterwards only PRs that changed
 since the previous poll are picked up.
 
+Each review first runs a deterministic security scan over the PR diff. A clean
+diff continues with the normal review and the project's tests. A diff that
+matches a risk rule (reading tokens or `~/.issuekiller`, `curl | sh`, install
+hooks, `permissions: write-all`, changes to `prompts/`/`AGENTS.md`, or the
+agent's own assessment in `review.json`) skips the agent and its tests; a
+`malicious` result adds the `agent:security-risk` label and blocks automatic
+fixes and merges until a maintainer removes the label and re-reviews. The
+dashboard shows it as a **Security risk** row. Expect occasional false
+positives (for example a legitimate CI permission change): they only cost a
+manual confirmation, never an automatic merge.
+
 The running daemon watches the config file with the OS notification API
 (inotify / kqueue via fsnotify, debounced, with a 30 s safety poll). A valid save
 triggers a graceful re-exec: it waits for running jobs, then replaces itself
@@ -568,7 +579,8 @@ Interrupted implementations resume from their worktree on the next start.
 | 👍 on the plan does nothing | reaction must be on the plan comment by an approver; the poll checks every 30 s |
 | 👍 on a blocked comment does nothing | the 👍 must be on the latest `Something went wrong` / blocked message and come from an approver; older status comments are forgotten |
 | every poll fails with `API rate limit exceeded` | the token burned its 5000/h core quota; polls and reactions stay blind until the window resets (`gh api rate_limit`). Check for repeated daemon starts (each runs a startup scan) |
-| stale `agent:*` labels | only `agent:awaiting-approval` is still managed; delete the leftover old labels by hand in the repo settings |
+| stale `agent:*` labels | only the lifecycle labels (`agent:awaiting-approval`, `agent:working`) are managed automatically; delete the leftover old labels by hand in the repo settings |
+| PR stuck with `agent:security-risk` | the review scan flagged it; read the alert comment, and once you are sure it is safe remove the label and run `@agent review` again |
 | `already running (pid N)` | use `-status` / `-stop`; never start a second instance |
 | desktop window says the engine exited | read `~/.issuekiller/logs/desktop-engine.log`; the usual cause is a daemon (or a second desktop) already holding `daemon.lock` |
 | update fails with `checksum mismatch` | do not bypass it; the release asset or the mirror is corrupt. Retry, or install the archive by hand after `sha256sum -c` |

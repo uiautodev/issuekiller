@@ -28,7 +28,7 @@ func TestDetectLanguage(t *testing.T) {
 // fmt append %!EXTRA(...) to the comment, which is exactly what happened to the
 // "not merging yet" hint.
 func TestScaffoldTextWithoutArgs(t *testing.T) {
-	for _, key := range []string{"ci.blocked.hint", "ci.repair.hint", "merge.failed.hint", "review.nothing"} {
+	for _, key := range []string{"ci.blocked.hint", "ci.repair.hint", "merge.failed.hint", "review.nothing", "security.blocked"} {
 		for _, lang := range []string{"zh", "en"} {
 			if got := scaffoldText(lang, key); strings.Contains(got, "%") {
 				t.Fatalf("%s/%s = %q, want no format verbs", lang, key, got)

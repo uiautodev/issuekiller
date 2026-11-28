@@ -80,6 +80,31 @@ func TestTriagePromptAsksForOneWord(t *testing.T) {
 	}
 }
 
+func TestReviewPromptTreatsPRAsUntrusted(t *testing.T) {
+	text, err := loadPrompt("review")
+	if err != nil {
+		t.Fatal(err)
+	}
+	flat := strings.Join(strings.Fields(text), " ")
+	for _, want := range []string{
+		"untrusted data",
+		"ignore these rules",
+		"~/.issuekiller",
+		"postinstall",
+		"stop running PR code",
+		"`security`",
+		"malicious",
+	} {
+		if !strings.Contains(flat, want) {
+			t.Errorf("review prompt is missing %q", want)
+		}
+	}
+	// Clean PRs keep the dynamic verification the old prompt already asked for.
+	if !strings.Contains(flat, "run the project's tests") {
+		t.Error("review prompt no longer asks for tests on a clean PR")
+	}
+}
+
 func TestRenderPromptReplacesPlaceholders(t *testing.T) {
 	text, err := renderPrompt("fix", map[string]string{"WORKTREE": "/tmp/worktree"})
 	if err != nil {

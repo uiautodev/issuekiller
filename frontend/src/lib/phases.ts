@@ -7,7 +7,7 @@ export interface PhaseMeta {
 }
 
 // Mirrors phaseNeedsUser in web.go: the ball is in the approver's court.
-export const WAIT_PHASES = ['awaiting_approval', 'pr_open', 'blocked'];
+export const WAIT_PHASES = ['awaiting_approval', 'pr_open', 'blocked', 'reviewflagged'];
 
 export function needsMe(phase: string): boolean {
 	return WAIT_PHASES.includes(phase);
@@ -29,7 +29,10 @@ export const PHASES: Record<string, PhaseMeta> = {
 	// step and a finished one fills it.
 	reviewing: { key: 'phase.reviewing', cls: 'working', step: 5 },
 	reviewed: { key: 'phase.reviewed', cls: 'done', step: 6 },
-	reviewfailed: { key: 'phase.reviewFailed', cls: 'blocked', step: 5 }
+	reviewfailed: { key: 'phase.reviewFailed', cls: 'blocked', step: 5 },
+	// The security scan stopped the flow: the row stays in the active list
+	// until a maintainer clears the label and re-reviews the PR.
+	reviewflagged: { key: 'phase.reviewFlagged', cls: 'blocked', step: 5 }
 };
 
 export function phaseMeta(phase: string): PhaseMeta {
